@@ -8,12 +8,18 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# The adb server protocol is spoken directly over tokio TCP (see src/adb.rs).
+# adb_client 3.2.3 is blocking (std::net) and pulls USB/mDNS/crypto deps we do
+# not need, so this crate does not use it.
 [dependencies]
 ap-core.workspace = true
-adb_client.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true
