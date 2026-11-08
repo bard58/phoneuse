@@ -94,12 +94,39 @@ pub struct RunReport {
     pub transcript: Vec<Message>,
 }
 
+/// An approved `confirm`: it allows exactly one call, the next one.
+struct Approval {
+    next: ToolCall,
+    /// The owner answered (not the automatic approval of confirm_irreversible=false).
+    owner: bool,
+}
+
+#[derive(Default)]
 struct RunState {
     messages: Vec<Message>,
-    /// Set by an approved `confirm`; consumed by the next action.
-    approval: Option<String>,
+    /// Set by an approved `confirm`; consumed (or cleared) by the next tool call.
+    approval: Option<Approval>,
+    /// The owner denied a `confirm`: only home/back run until the owner
+    /// answers `ask_user` or approves a new `confirm`.
+    denied: bool,
+    /// The screenshot after the last action failed: the next action needs a `look` first.
+    need_look: bool,
+    /// The last screen text suggested a lock screen or a passcode field.
+    lock_screen: bool,
+    /// `unlock` was called and did not end with "unlocked" / "not locked".
+    lock_unresolved: bool,
+    /// Digits typed in a row (type_text digits only, press_key digits).
+    digit_run: u32,
+    /// The last action typed text (a tap now may press Send).
+    typed_recently: bool,
     step: u32,
     usage: UsageLog,
+}
+
+impl RunState {
+    fn lock_likely(&self) -> bool {
+        self.lock_screen || self.lock_unresolved
+    }
 }
 
 struct ToolOutput {
@@ -190,11 +217,17 @@ impl Agent {
         self.host.on_step(&e);
     }
 
-    /// Run `fut` unless the run is cancelled first.
+    /// Run `fut` unless the run is cancelled first. On a cancel the device
+    /// is also told to stop the calls it already received, because dropping
+    /// the future does not stop work a backend worker thread has started
+    /// (for example an iPhone long press or text entry).
     async fn guard<T>(&self, fut: impl Future<Output = T>) -> Option<T> {
         tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => None,
+            _ = self.cancel.cancelled() => {
+                self.device.cancel();
+                None
+            }
             v = fut => Some(v),
         }
     }
@@ -225,12 +258,7 @@ impl Agent {
             device: format!("{} ({}, {})", info.name, info.platform, info.backend),
             model: model.clone(),
         });
-        let mut st = RunState {
-            messages: Vec::new(),
-            approval: None,
-            step: 0,
-            usage: UsageLog::default(),
-        };
+        let mut st = RunState::default();
         if self.cancel.is_cancelled() {
             return self.finish(Outcome::Cancelled, st);
         }
@@ -247,6 +275,7 @@ impl Agent {
             }
             Some(Ok(o)) => o,
         };
+        st.lock_screen = tools::lock_screen_hint(&first.text);
         let mut content = vec![ContentBlock::text(prompt::task_message(task, info))];
         content.extend(first.to_blocks());
         st.messages.push(Message::user(content));
@@ -270,7 +299,11 @@ impl Agent {
                 cache: true,
             };
             let resp = match self.guard(self.provider.complete(req)).await {
-                None => return self.finish(Outcome::Cancelled, st),
+                None => {
+                    // The provider may still bill this call; the summary says so.
+                    st.usage.cancelled_calls += 1;
+                    return self.finish(Outcome::Cancelled, st);
+                }
                 Some(Err(e)) => {
                     return self.finish(
                         Outcome::Failed {
@@ -302,8 +335,21 @@ impl Agent {
                     text: text.clone(),
                 });
             }
-            // Append-only history: the assistant turn goes back exactly as received.
-            st.messages.push(Message::assistant(resp.content.clone()));
+            // Append-only history: the assistant turn goes back exactly as received,
+            // except an empty turn, which the APIs reject: it gets a placeholder so
+            // the roles still alternate.
+            let usable = resp.content.iter().any(|b| match b {
+                ContentBlock::Text { text } => !text.is_empty(),
+                ContentBlock::ToolUse { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Opaque { .. } => true,
+                _ => false,
+            });
+            st.messages.push(Message::assistant(if usable {
+                resp.content.clone()
+            } else {
+                vec![ContentBlock::text("(no response)")]
+            }));
 
             if resp.stop_reason == StopReason::Refusal {
                 return self.finish(
@@ -358,7 +404,7 @@ impl Agent {
                 self.emit(AgentEvent::ToolCall {
                     step,
                     name: name.clone(),
-                    input: input.clone(),
+                    input: tools::redact_input(&name, &input),
                 });
                 let out = match tools::parse(&name, &input) {
                     Err(msg) => ToolOutput::error(format!("error: {msg}")),
@@ -392,65 +438,55 @@ impl Agent {
         st: &mut RunState,
     ) -> Option<ToolOutput> {
         if call.is_action() {
-            let approved = st.approval.take();
-            if call.irreversible() && self.options.confirm_irreversible && approved.is_none() {
-                return Some(ToolOutput::error(
-                    "refused: this action is marked irreversible, but no approval is pending. Call `confirm` first, and do the action only if the owner approves.",
-                ));
-            }
-            if let ToolCall::TypeText { text, .. } = &call
-                && tools::looks_like_passcode(text)
-                && approved.is_none()
-            {
-                return Some(ToolOutput::error(
-                    "refused: this looks like a passcode or PIN. Never type passcodes: on the lock screen call `unlock`. If the owner explicitly asked you to type this number, call `confirm` first.",
-                ));
-            }
-            let msg = match self.act(&call).await {
-                Ok(m) => m,
-                Err(e) => {
-                    let mut t = format!("error: {e}");
-                    if let Some(h) = e.hint() {
-                        t.push_str(&format!(" (fix: {h})"));
-                    }
-                    return Some(ToolOutput::error(t));
-                }
-            };
-            return if observe {
-                self.with_screen(msg, false).await
-            } else {
-                Some(ToolOutput::text(msg))
-            };
+            return self.execute_action(call, observe, st).await;
+        }
+        // An approval covers only the very next call; any other tool clears it.
+        if !matches!(call, ToolCall::Confirm { .. }) {
+            st.approval = None;
         }
         match call {
-            ToolCall::Look => self.with_screen(String::new(), true).await,
+            ToolCall::Look => self.with_screen(String::new(), true, st).await,
             ToolCall::Wait { seconds } => {
                 self.guard(tokio::time::sleep(Duration::from_secs_f32(seconds)))
                     .await?;
-                self.with_screen(format!("waited {seconds:.1} s"), false)
+                self.with_screen(format!("waited {seconds:.1} s"), false, st)
                     .await
             }
-            ToolCall::Confirm { action, details } => {
-                if !self.options.confirm_irreversible {
-                    st.approval = Some(action);
-                    return Some(ToolOutput::text(
-                        "approved (confirmations are turned off in the config). Do that action next, with irreversible=true.",
-                    ));
+            ToolCall::Confirm {
+                action,
+                details,
+                next,
+            } => {
+                let next = *next;
+                let planned = tools::describe(&next);
+                // Digit entry (a possible passcode) always needs the owner, even
+                // with confirmations turned off.
+                if !self.options.confirm_irreversible && tools::digit_entry(&next).is_none() {
+                    st.approval = Some(Approval { next, owner: false });
+                    return Some(ToolOutput::text(format!(
+                        "approved (confirmations are turned off in the config). Do exactly this next: {planned}."
+                    )));
                 }
+                let details = Some(match details {
+                    Some(d) => format!("{d}\nNext step: {planned}"),
+                    None => format!("Next step: {planned}"),
+                });
                 let req = ConfirmRequest {
                     kind: ConfirmKind::Irreversible,
-                    action: action.clone(),
+                    action,
                     details,
                 };
                 if self.guard(self.host.confirm(&req)).await? {
-                    st.approval = Some(action);
-                    Some(ToolOutput::text(
-                        "approved by the owner. Do exactly that action next, with irreversible=true.",
-                    ))
+                    st.approval = Some(Approval { next, owner: true });
+                    st.denied = false;
+                    Some(ToolOutput::text(format!(
+                        "approved by the owner. Do exactly this next, with irreversible=true: {planned}. Any other call cancels the approval."
+                    )))
                 } else {
                     st.approval = None;
+                    st.denied = true;
                     Some(ToolOutput::text(
-                        "denied by the owner. Do not do it. Ask what to do instead, or call `done`.",
+                        "denied by the owner. Do not do it. Until the owner answers an `ask_user` question or approves a new `confirm`, only `home` and `back` run. Ask what to do instead, or call `done`.",
                     ))
                 }
             }
@@ -459,16 +495,150 @@ impl Agent {
                 Some(ToolOutput::text(if answer.trim().is_empty() {
                     "The owner did not answer.".to_string()
                 } else {
+                    // A new instruction from the owner ends a denial.
+                    st.denied = false;
                     format!("The owner answered: {answer}")
                 }))
             }
-            ToolCall::Unlock => self.unlock().await,
+            ToolCall::Unlock => self.unlock(st).await,
             // Actions and Done are handled above / by the caller.
             _ => Some(ToolOutput::error("error: tool not available here")),
         }
     }
 
-    async fn unlock(&self) -> Option<ToolOutput> {
+    /// Why this action needs an approved `confirm`, if it does. Host-side
+    /// rules on top of the model's own `irreversible` flag. `None` from the
+    /// outer option = cancelled.
+    async fn needs_confirm(&self, call: &ToolCall, st: &RunState) -> Option<Option<String>> {
+        if call.irreversible() {
+            return Some(Some("this action is marked irreversible".into()));
+        }
+        match call {
+            ToolCall::TypeText { text, .. } if text.contains(['\n', '\r']) => {
+                return Some(Some(
+                    "this text contains a newline, which presses Enter and can send it".into(),
+                ));
+            }
+            ToolCall::PressKey { key, .. } if matches!(key.parts().1, Key::Enter) => {
+                return Some(Some("Enter can send or submit what was typed".into()));
+            }
+            ToolCall::Tap { .. } | ToolCall::DoubleTap { .. } | ToolCall::LongPress { .. }
+                if st.typed_recently =>
+            {
+                let app = self
+                    .guard(self.device.foreground_app())
+                    .await?
+                    .ok()
+                    .flatten();
+                return Some(match app {
+                    Some(id) if !tools::sensitive_app(&id) => None,
+                    Some(id) => Some(format!(
+                        "a tap right after typing in {id} can send a message or a payment"
+                    )),
+                    None => Some(
+                        "a tap right after typing can send what was typed, and the app in front is unknown"
+                            .into(),
+                    ),
+                });
+            }
+            _ => {}
+        }
+        Some(None)
+    }
+
+    /// The safety gates, the action, then the screen. `None` = cancelled.
+    async fn execute_action(
+        &self,
+        call: ToolCall,
+        observe: bool,
+        st: &mut RunState,
+    ) -> Option<ToolOutput> {
+        let approval = st.approval.take();
+        if st.denied && !matches!(call, ToolCall::Home | ToolCall::Back) {
+            return Some(ToolOutput::error(
+                "refused: the owner denied the last confirmation. Only `home` and `back` run until the owner answers an `ask_user` question or approves a new `confirm`.",
+            ));
+        }
+        if st.need_look {
+            return Some(ToolOutput::error(
+                "refused: the screenshot after the last action failed, so its result is unknown. Call `look` first.",
+            ));
+        }
+        let approved = match approval {
+            None => None,
+            Some(a) if tools::same_action(&a.next, &call) => Some(a),
+            Some(a) => {
+                return Some(ToolOutput::error(format!(
+                    "refused: this is not the approved action ({}). The approval is cancelled; call `confirm` again for the action you want.",
+                    tools::describe(&a.next)
+                )));
+            }
+        };
+        let input = matches!(call, ToolCall::TypeText { .. } | ToolCall::PressKey { .. });
+        if input && st.lock_likely() {
+            return Some(ToolOutput::error(
+                "refused: the phone looks locked, or a passcode or password field is shown. No typing or keys here: call `unlock`, or call `done` with success=false and ask the owner to unlock the phone.",
+            ));
+        }
+        let digits = tools::digit_entry(&call);
+        if let Some(n) = digits {
+            let run = st.digit_run + n;
+            if run >= 4 && !approved.as_ref().is_some_and(|a| a.owner) {
+                return Some(ToolOutput::error(format!(
+                    "refused: this would make {run} digits in a row, which could be a passcode or PIN. Never type passcodes: on the lock screen call `unlock`. If the owner explicitly asked you to type this number, call `confirm` with this exact call first; the owner must approve it."
+                )));
+            }
+        }
+        if self.options.confirm_irreversible
+            && approved.is_none()
+            && let Some(why) = self.needs_confirm(&call, st).await?
+        {
+            return Some(ToolOutput::error(format!(
+                "refused: {why}, and no approval is pending. Call `confirm` with this exact call (tool and input) first, and do it only if the owner approves."
+            )));
+        }
+
+        let result = self.guard(self.act(&call)).await?;
+        // State for the next gates. A failed action may have done part of its work.
+        match &call {
+            ToolCall::TypeText { .. } => st.typed_recently = true,
+            ToolCall::PressKey { .. } => {}
+            _ => st.typed_recently = false,
+        }
+        match (&call, digits) {
+            (_, Some(n)) => st.digit_run += n,
+            (
+                ToolCall::TypeText { .. }
+                | ToolCall::OpenApp { .. }
+                | ToolCall::Home
+                | ToolCall::Back
+                | ToolCall::Button { .. },
+                None,
+            ) => st.digit_run = 0,
+            // Taps, swipes and other keys do not end a run: a passcode can be
+            // split around them.
+            _ => {}
+        }
+        let msg = match result {
+            Ok(m) => m,
+            Err(e) => {
+                let mut t = format!("error: {e}");
+                if let Some(h) = e.hint() {
+                    t.push_str(&format!(" (fix: {h})"));
+                }
+                return Some(ToolOutput::error(t));
+            }
+        };
+        if observe {
+            self.with_screen(msg, false, st).await
+        } else {
+            Some(ToolOutput::text(msg))
+        }
+    }
+
+    async fn unlock(&self, st: &mut RunState) -> Option<ToolOutput> {
+        // The model thinks the phone is locked: block typing until it is not.
+        st.lock_unresolved = true;
         if !self.options.allow_unlock {
             return Some(ToolOutput::error(
                 "refused: unlocking is turned off in the config (safety.allow_unlock). Call `done` with success=false and ask the owner to unlock the phone.",
@@ -498,11 +668,16 @@ impl Agent {
                 "the owner did not approve the unlock. Call `done` with success=false.",
             ));
         }
-        self.unlock_attempts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(Instant::now());
+        let tried = Instant::now();
         let r = self.guard(self.host.unlock(&*self.device)).await?;
+        // A host that cannot unlock (for example the CLI) did not try, so it
+        // does not use up the hourly limit.
+        if !matches!(r, UnlockResult::Unavailable(_)) {
+            self.unlock_attempts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(tried);
+        }
         let (msg, err) = match r {
             UnlockResult::Unlocked => ("unlocked".to_string(), false),
             UnlockResult::NotLocked => ("not locked".to_string(), false),
@@ -515,12 +690,19 @@ impl Agent {
         if err {
             Some(ToolOutput::error(msg))
         } else {
-            self.with_screen(msg, true).await
+            st.lock_unresolved = false;
+            self.with_screen(msg, true, st).await
         }
     }
 
-    /// Text plus a screen observation. A failed screenshot becomes a note.
-    async fn with_screen(&self, msg: String, settled: bool) -> Option<ToolOutput> {
+    /// Text plus a screen observation. A failed screenshot is an error result,
+    /// and the next action is refused until a `look` succeeds.
+    async fn with_screen(
+        &self,
+        msg: String,
+        settled: bool,
+        st: &mut RunState,
+    ) -> Option<ToolOutput> {
         let obs = if settled {
             self.guard(self.observer.look(&*self.device)).await?
         } else {
@@ -531,14 +713,22 @@ impl Agent {
         if !msg.is_empty() {
             content.push(ContentBlock::text(msg));
         }
-        match obs {
-            Ok(o) => content.extend(o.to_blocks()),
-            Err(e) => content.push(ContentBlock::text(format!("(no screenshot: {e})"))),
-        }
-        Some(ToolOutput {
-            content,
-            is_error: false,
-        })
+        let is_error = match obs {
+            Ok(o) => {
+                st.need_look = false;
+                st.lock_screen = tools::lock_screen_hint(&o.text);
+                content.extend(o.to_blocks());
+                false
+            }
+            Err(e) => {
+                st.need_look = true;
+                content.push(ContentBlock::text(format!(
+                    "error: no screenshot ({e}). You cannot see the result, so the screen may not be what you expect. Call `look` before the next action."
+                )));
+                true
+            }
+        };
+        Some(ToolOutput { content, is_error })
     }
 
     /// Perform a device action. Returns a short note for the model.
@@ -573,11 +763,22 @@ impl Agent {
                 Ok("scrolled".into())
             }
             ToolCall::TypeText { text, .. } => {
+                // Check the take-over flag between parts, so that a part that
+                // was cut short is never followed by Enter.
+                let stop = || {
+                    if self.cancel.is_cancelled() {
+                        Err(ap_core::Error::Other("cancelled by the owner".into()))
+                    } else {
+                        Ok(())
+                    }
+                };
                 for (i, part) in text.split('\n').enumerate() {
                     if i > 0 {
+                        stop()?;
                         d.key(&Key::Enter).await?;
                     }
                     if !part.is_empty() {
+                        stop()?;
                         d.type_text(part).await?;
                     }
                 }

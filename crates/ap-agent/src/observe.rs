@@ -104,17 +104,36 @@ impl ScreenObserver {
 #[async_trait::async_trait]
 impl Observer for ScreenObserver {
     async fn look(&self, device: &dyn Device) -> Result<Observation> {
-        let frame = ap_screen::settle(device, self.settle_timeout, self.settle_quiet).await?;
-        self.single(&frame, "Current screen (settled).")
+        let s = ap_screen::settle_with(
+            device,
+            ap_screen::SettleConfig {
+                timeout: self.settle_timeout,
+                quiet: self.settle_quiet,
+                ..ap_screen::SettleConfig::default()
+            },
+        )
+        .await?;
+        let label = settled_label(&s);
+        self.single(&s.frame, &label)
     }
 
     async fn after_action(&self, device: &dyn Device) -> Result<Observation> {
-        let frames = ap_screen::frame_strip(device, &self.strip_offsets).await?;
-        let offsets: Vec<Duration> = self.strip_offsets.clone();
+        // Real capture times, not the planned offsets: a slow screenshot
+        // shifts every later frame.
+        let timed = ap_screen::frame_strip_timed(device, &self.strip_offsets).await?;
+        let (frames, offsets): (Vec<Frame>, Vec<Duration>) = timed.into_iter().unzip();
         let (kept, times) = dedup(&frames, &offsets);
         if kept.len() <= 1 {
-            // Still screen: the last frame, full size.
+            // One frame: the last one, full size.
             let last = frames.last().unwrap_or(&kept[0]);
+            if frames.len() < self.strip_offsets.len() {
+                let label = format!(
+                    "Screen after the action (one frame only: {} of {} screenshots failed, so motion is unknown).",
+                    self.strip_offsets.len() - frames.len(),
+                    self.strip_offsets.len()
+                );
+                return self.single(last, &label);
+            }
             return self.single(last, "Screen after the action (it was still).");
         }
         let scaled: Vec<Frame> = kept
@@ -142,6 +161,21 @@ impl Observer for ScreenObserver {
                 n = scaled.len()
             ),
         })
+    }
+}
+
+/// The label for a settled `look`: it says when the screen never became
+/// still, or when part of it keeps moving.
+fn settled_label(s: &ap_screen::Settled) -> String {
+    if !s.still {
+        "Current screen (the screen was still changing when read; it may not be final).".into()
+    } else if s.ambient || s.ignored > 0.05 {
+        format!(
+            "Current screen (settled; part of it keeps moving, e.g. video or animation, about {:.0}% ignored).",
+            s.ignored * 100.0
+        )
+    } else {
+        "Current screen (settled).".into()
     }
 }
 

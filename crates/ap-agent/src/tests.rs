@@ -234,7 +234,10 @@ async fn tap_then_done() {
 async fn irreversible_needs_confirm() {
     let p = Scripted::new(vec![
         call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
-        call("confirm", json!({"action": "Send the message to Alex"})),
+        call(
+            "confirm",
+            json!({"action": "Send the message to Alex", "tool": "tap", "input": {"x": 0.9, "y": 0.9}}),
+        ),
         call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
         // Approval is used up: a second irreversible tap is refused again.
         call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
@@ -260,12 +263,20 @@ async fn irreversible_needs_confirm() {
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].kind, ConfirmKind::Irreversible);
     assert_eq!(c[0].action, "Send the message to Alex");
+    assert!(
+        c[0].details
+            .as_deref()
+            .is_some_and(|d| d.contains("Next step: tap at (0.900, 0.900)"))
+    );
 }
 
 #[tokio::test]
 async fn denied_confirm_blocks_action() {
     let p = Scripted::new(vec![
-        call("confirm", json!({"action": "Delete photo"})),
+        call(
+            "confirm",
+            json!({"action": "Delete photo", "tool": "tap", "input": {"x": 0.5, "y": 0.5}}),
+        ),
         call("tap", json!({"x": 0.5, "y": 0.5, "irreversible": true})),
     ]);
     let dev = mock();
@@ -352,7 +363,10 @@ async fn step_limit() {
 
 #[tokio::test]
 async fn cancel_during_confirm() {
-    let p = Scripted::new(vec![call("confirm", json!({"action": "Pay"}))]);
+    let p = Scripted::new(vec![call(
+        "confirm",
+        json!({"action": "Pay", "tool": "tap", "input": {"x": 0.5, "y": 0.9}}),
+    )]);
     let dev = mock();
     let host = Arc::new(Host::default());
     let a = agent(p.clone(), &dev, host.clone(), AgentOptions::default());
@@ -385,12 +399,21 @@ async fn cancel_while_waiting_for_llm() {
         .unwrap()
         .unwrap();
     assert_eq!(r.outcome, Outcome::Cancelled);
+    assert_eq!(r.usage.cancelled_calls, 1);
+    assert!(r.usage.summary().contains("lower bound"));
 }
 
 #[tokio::test]
 async fn actions_map_to_device() {
     let p = Scripted::new(vec![
-        call("type_text", json!({"text": "hi\nthere"})),
+        call(
+            "confirm",
+            json!({"action": "Send hi there", "tool": "type_text", "input": {"text": "hi\nthere"}}),
+        ),
+        call(
+            "type_text",
+            json!({"text": "hi\nthere", "irreversible": true}),
+        ),
         call("scroll", json!({"direction": "down", "amount": 0.4})),
         call("press_key", json!({"key": "cmd+a"})),
         call("button", json!({"name": "app_switcher"})),
@@ -405,6 +428,7 @@ async fn actions_map_to_device() {
     let dev = mock();
     let host = Arc::new(Host {
         answer: "Alex Kim".into(),
+        approve: true,
         ..Host::default()
     });
     agent(p.clone(), &dev, host, AgentOptions::default())
@@ -444,9 +468,9 @@ async fn actions_map_to_device() {
     assert!(matches!(c[8], Gesture::Button { .. }));
     assert_eq!(c.len(), 9, "bad open_app and out-of-range tap did nothing");
     let reqs = p.requests();
-    assert!(last_results(&reqs[6])[0].1, "unknown app is an error");
-    assert!(last_results(&reqs[9])[0].0.contains("fractions"));
-    assert!(last_results(&reqs[10])[0].0.contains("Alex Kim"));
+    assert!(last_results(&reqs[7])[0].1, "unknown app is an error");
+    assert!(last_results(&reqs[10])[0].0.contains("fractions"));
+    assert!(last_results(&reqs[11])[0].0.contains("Alex Kim"));
 }
 
 #[tokio::test]
@@ -539,4 +563,522 @@ fn options_from_config() {
     assert_eq!(o.model.as_deref(), Some("claude-opus-5-5"));
     assert_eq!(o.max_steps, 7);
     assert!(o.allow_unlock && o.confirm_irreversible);
+}
+
+/// A mock with knobs: slow typing, one failing screenshot, a foreground app.
+#[derive(Clone)]
+struct TestDevice {
+    inner: MockDevice,
+    type_delay: Duration,
+    /// 1-based number of the screenshot that fails.
+    fail_screenshot: Option<u32>,
+    shots: Arc<Mutex<u32>>,
+    foreground: Option<String>,
+    /// How many times the agent called `Device::cancel`.
+    cancels: Arc<Mutex<u32>>,
+}
+
+impl TestDevice {
+    fn new(inner: &MockDevice) -> Self {
+        Self {
+            inner: inner.clone(),
+            type_delay: Duration::ZERO,
+            fail_screenshot: None,
+            shots: Arc::default(),
+            foreground: None,
+            cancels: Arc::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ap_core::Device for TestDevice {
+    fn info(&self) -> &ap_core::DeviceInfo {
+        self.inner.info()
+    }
+    fn capabilities(&self) -> ap_core::Capabilities {
+        self.inner.capabilities()
+    }
+    fn cancel(&self) {
+        *self.cancels.lock().unwrap() += 1;
+    }
+    async fn screenshot(&self) -> ap_core::Result<ap_core::Frame> {
+        let n = {
+            let mut s = self.shots.lock().unwrap();
+            *s += 1;
+            *s
+        };
+        if self.fail_screenshot == Some(n) {
+            return Err(ap_core::Error::Other("capture failed".into()));
+        }
+        self.inner.screenshot().await
+    }
+    async fn tap(&self, at: Point) -> ap_core::Result<()> {
+        self.inner.tap(at).await
+    }
+    async fn double_tap(&self, at: Point) -> ap_core::Result<()> {
+        self.inner.double_tap(at).await
+    }
+    async fn long_press(&self, at: Point, d: Duration) -> ap_core::Result<()> {
+        self.inner.long_press(at, d).await
+    }
+    async fn swipe(&self, a: Point, b: Point, d: Duration) -> ap_core::Result<()> {
+        self.inner.swipe(a, b, d).await
+    }
+    async fn scroll(&self, at: Point, dir: SwipeDirection, amount: f32) -> ap_core::Result<()> {
+        self.inner.scroll(at, dir, amount).await
+    }
+    async fn type_text(&self, text: &str) -> ap_core::Result<()> {
+        if !self.type_delay.is_zero() {
+            tokio::time::sleep(self.type_delay).await;
+        }
+        self.inner.type_text(text).await
+    }
+    async fn key(&self, key: &Key) -> ap_core::Result<()> {
+        self.inner.key(key).await
+    }
+    async fn button(&self, b: ap_core::Button) -> ap_core::Result<()> {
+        self.inner.button(b).await
+    }
+    async fn launch_app(&self, id: &str) -> ap_core::Result<()> {
+        self.inner.launch_app(id).await
+    }
+    async fn foreground_app(&self) -> ap_core::Result<Option<String>> {
+        Ok(self.foreground.clone())
+    }
+}
+
+fn agent_on(p: Arc<Scripted>, dev: TestDevice, host: Arc<Host>, opts: AgentOptions) -> Agent {
+    Agent::new(p, Box::new(dev), host, opts).with_observer(Box::new(ScreenObserver::instant()))
+}
+
+fn confirm_call(action: &str, tool: &str, input: Value) -> Response {
+    call(
+        "confirm",
+        json!({"action": action, "tool": tool, "input": input}),
+    )
+}
+
+#[tokio::test]
+async fn denial_blocks_later_unflagged_actions() {
+    let p = Scripted::new(vec![
+        confirm_call("Send the message", "tap", json!({"x": 0.9, "y": 0.9})),
+        // No irreversible flag: still refused after the denial.
+        call("tap", json!({"x": 0.9, "y": 0.9})),
+        call("home", json!({})),
+        call("ask_user", json!({"question": "What now?"})),
+        call("tap", json!({"x": 0.5, "y": 0.5})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    let host = Arc::new(Host {
+        answer: "Open Settings instead".into(),
+        ..Host::default()
+    });
+    agent(p.clone(), &dev, host, AgentOptions::default())
+        .run("x")
+        .await;
+    let reqs = p.requests();
+    let (t, err) = &last_results(&reqs[2])[0];
+    assert!(*err && t.contains("denied"), "{t}");
+    assert!(!last_results(&reqs[3])[0].1, "home still runs");
+    assert!(
+        !last_results(&reqs[5])[0].1,
+        "the owner's answer ends the block"
+    );
+    assert_eq!(
+        dev.calls(),
+        vec![
+            Gesture::Button {
+                button: ap_core::Button::Home
+            },
+            Gesture::Tap {
+                at: Point::new(0.5, 0.5)
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn approval_is_bound_to_one_call() {
+    let p = Scripted::new(vec![
+        confirm_call(
+            "Send 'On my way'",
+            "type_text",
+            json!({"text": "On my way\n"}),
+        ),
+        call(
+            "type_text",
+            json!({"text": "different text\n", "irreversible": true}),
+        ),
+        // The mismatch used up the approval.
+        call(
+            "type_text",
+            json!({"text": "On my way\n", "irreversible": true}),
+        ),
+        confirm_call("Send", "tap", json!({"x": 0.9, "y": 0.9})),
+        call("look", json!({})),
+        // `look` cleared the approval.
+        call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    let host = Arc::new(Host {
+        approve: true,
+        ..Host::default()
+    });
+    agent(p.clone(), &dev, host, AgentOptions::default())
+        .run("x")
+        .await;
+    assert!(dev.calls().is_empty());
+    let reqs = p.requests();
+    assert!(
+        last_results(&reqs[2])[0]
+            .0
+            .contains("not the approved action")
+    );
+    assert!(last_results(&reqs[3])[0].0.contains("no approval"));
+    assert!(last_results(&reqs[6])[0].0.contains("no approval"));
+}
+
+#[tokio::test]
+async fn host_classifier_requires_confirm() {
+    let p = Scripted::new(vec![
+        call("type_text", json!({"text": "hi\n"})),
+        call("press_key", json!({"key": "enter"})),
+        call("press_key", json!({"key": "cmd+return"})),
+        call("type_text", json!({"text": "hi"})),
+        // Right after typing, the app in front is unknown: needs confirm.
+        call("tap", json!({"x": 0.9, "y": 0.9})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    agent(
+        p.clone(),
+        &dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    assert_eq!(dev.calls(), vec![Gesture::TypeText { text: "hi".into() }]);
+    let reqs = p.requests();
+    assert!(last_results(&reqs[1])[0].0.contains("newline"));
+    assert!(last_results(&reqs[2])[0].0.contains("Enter"));
+    assert!(last_results(&reqs[3])[0].0.contains("Enter"));
+    assert!(last_results(&reqs[5])[0].0.contains("unknown"));
+
+    // In a messaging app the tap after typing needs confirm; in Notes it does not.
+    for (app, runs) in [
+        ("com.apple.MobileSMS", false),
+        ("com.apple.mobilenotes", true),
+    ] {
+        let p = Scripted::new(vec![
+            call("type_text", json!({"text": "hi"})),
+            call("tap", json!({"x": 0.9, "y": 0.9})),
+            call("done", json!({"summary": "ok"})),
+        ]);
+        let base = mock();
+        let mut dev = TestDevice::new(&base);
+        dev.foreground = Some(app.into());
+        agent_on(
+            p.clone(),
+            dev,
+            Arc::new(Host::default()),
+            AgentOptions::default(),
+        )
+        .run("x")
+        .await;
+        assert_eq!(base.calls().len(), if runs { 2 } else { 1 }, "{app}");
+    }
+}
+
+#[tokio::test]
+async fn split_and_padded_digits_are_refused() {
+    let p = Scripted::new(vec![
+        call("press_key", json!({"key": "4"})),
+        call("press_key", json!({"key": "8"})),
+        call("press_key", json!({"key": "2"})),
+        call("press_key", json!({"key": "1"})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    agent(
+        p.clone(),
+        &dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    assert_eq!(dev.calls().len(), 3);
+    assert!(
+        last_results(&p.requests()[4])[0]
+            .0
+            .contains("4 digits in a row")
+    );
+
+    let p = Scripted::new(vec![
+        call("type_text", json!({"text": "48"})),
+        call("tap", json!({"x": 0.5, "y": 0.5})),
+        call("type_text", json!({"text": "21"})),
+        call("type_text", json!({"text": "hello"})),
+        call("type_text", json!({"text": "4821 "})),
+        call(
+            "type_text",
+            json!({"text": "\u{ff14}\u{ff18}\u{ff12}\u{ff11}"}),
+        ),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let base = mock();
+    let mut dev = TestDevice::new(&base);
+    dev.foreground = Some("com.apple.mobilenotes".into());
+    agent_on(
+        p.clone(),
+        dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    let reqs = p.requests();
+    assert!(last_results(&reqs[3])[0].0.contains("passcode"));
+    assert!(
+        !last_results(&reqs[4])[0].1,
+        "plain text runs and ends the run"
+    );
+    assert!(last_results(&reqs[5])[0].0.contains("passcode"));
+    assert!(last_results(&reqs[6])[0].0.contains("passcode"));
+    assert_eq!(
+        base.calls()
+            .iter()
+            .filter(|g| matches!(g, Gesture::TypeText { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn passcode_needs_owner_even_with_confirmations_off() {
+    let opts = AgentOptions {
+        confirm_irreversible: false,
+        ..AgentOptions::default()
+    };
+    let script = || {
+        Scripted::new(vec![
+            call("type_text", json!({"text": "123456"})),
+            confirm_call("Type the code", "type_text", json!({"text": "123456"})),
+            call("type_text", json!({"text": "123456"})),
+            call("done", json!({"summary": "ok"})),
+        ])
+    };
+    // The owner denies: never typed, although confirmations are off.
+    let p = script();
+    let dev = mock();
+    let host = Arc::new(Host::default());
+    agent(p.clone(), &dev, host.clone(), opts.clone())
+        .run("x")
+        .await;
+    assert!(dev.calls().is_empty());
+    assert_eq!(
+        host.confirms.lock().unwrap().len(),
+        1,
+        "the owner was asked"
+    );
+    assert!(last_results(&p.requests()[2])[0].0.contains("denied"));
+
+    // The owner approves: typed once.
+    let p = script();
+    let dev = mock();
+    let host = Arc::new(Host {
+        approve: true,
+        ..Host::default()
+    });
+    agent(p.clone(), &dev, host, opts.clone()).run("x").await;
+    assert_eq!(
+        dev.calls(),
+        vec![Gesture::TypeText {
+            text: "123456".into()
+        }]
+    );
+
+    // A non-digit confirm with confirmations off does not ask the owner.
+    let p = Scripted::new(vec![
+        confirm_call("Send", "tap", json!({"x": 0.9, "y": 0.9})),
+        call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
+    ]);
+    let dev = mock();
+    let host = Arc::new(Host::default());
+    agent(p, &dev, host.clone(), opts).run("x").await;
+    assert!(host.confirms.lock().unwrap().is_empty());
+    assert_eq!(dev.calls().len(), 1);
+}
+
+/// Adds lock-screen text to every observation (like an OCR observer would).
+struct LockObserver(ScreenObserver);
+
+#[async_trait::async_trait]
+impl Observer for LockObserver {
+    async fn look(&self, d: &dyn ap_core::Device) -> ap_core::Result<Observation> {
+        let mut o = self.0.look(d).await?;
+        o.text.push_str("\nScreen text: Enter Passcode | Emergency");
+        Ok(o)
+    }
+    async fn after_action(&self, d: &dyn ap_core::Device) -> ap_core::Result<Observation> {
+        let mut o = self.0.after_action(d).await?;
+        o.text.push_str("\nScreen text: Enter Passcode | Emergency");
+        Ok(o)
+    }
+}
+
+#[tokio::test]
+async fn lock_screen_blocks_text_and_keys() {
+    let p = Scripted::new(vec![
+        call("type_text", json!({"text": "hello"})),
+        call("press_key", json!({"key": "a"})),
+        call("tap", json!({"x": 0.5, "y": 0.5})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    Agent::new(
+        p.clone(),
+        Box::new(dev.clone()),
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .with_observer(Box::new(LockObserver(ScreenObserver::instant())))
+    .run("x")
+    .await;
+    let reqs = p.requests();
+    assert!(last_results(&reqs[1])[0].0.contains("looks locked"));
+    assert!(last_results(&reqs[2])[0].0.contains("looks locked"));
+    assert_eq!(dev.calls().len(), 1, "only the tap ran");
+
+    // The model called `unlock` and it did not succeed: typing stays blocked.
+    let p = Scripted::new(vec![
+        call("unlock", json!({})),
+        call("type_text", json!({"text": "hello"})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let dev = mock();
+    agent(
+        p.clone(),
+        &dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    assert!(dev.calls().is_empty());
+    assert!(last_results(&p.requests()[2])[0].0.contains("looks locked"));
+}
+
+#[tokio::test]
+async fn events_redact_digit_text() {
+    let p = Scripted::new(vec![
+        call("type_text", json!({"text": "123456"})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let host = Arc::new(Host::default());
+    agent(p, &mock(), host.clone(), AgentOptions::default())
+        .run("x")
+        .await;
+    let ev = host.events.lock().unwrap();
+    let input = ev
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCall { name, input, .. } if name == "type_text" => Some(input.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input["text"], "[6 digits, redacted]");
+    assert!(!format!("{ev:?}").contains("123456"));
+}
+
+#[tokio::test]
+async fn cancel_during_type_text_never_presses_enter() {
+    let opts = AgentOptions {
+        confirm_irreversible: false,
+        ..AgentOptions::default()
+    };
+    let p = Scripted::new(vec![call(
+        "type_text",
+        json!({"text": "I quit, effective today\n"}),
+    )]);
+    let base = mock();
+    let mut dev = TestDevice::new(&base);
+    dev.type_delay = Duration::from_secs(30);
+    let cancels = dev.cancels.clone();
+    let a = Arc::new(agent_on(p, dev, Arc::new(Host::default()), opts));
+    let t = a.cancel_token();
+    let a2 = a.clone();
+    let h = tokio::spawn(async move { a2.run("x").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    t.cancel();
+    let r = tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .expect("cancel stops the action at once")
+        .unwrap();
+    assert_eq!(r.outcome, Outcome::Cancelled);
+    assert!(
+        !base
+            .calls()
+            .iter()
+            .any(|g| matches!(g, Gesture::Key { key: Key::Enter })),
+        "Enter was pressed after take-over"
+    );
+    assert!(
+        *cancels.lock().unwrap() >= 1,
+        "the device was not told to stop the call it already received"
+    );
+}
+
+#[tokio::test]
+async fn failed_screenshot_forces_a_look() {
+    let p = Scripted::new(vec![
+        call("tap", json!({"x": 0.1, "y": 0.1})),
+        call("tap", json!({"x": 0.2, "y": 0.2})),
+        call("look", json!({})),
+        call("tap", json!({"x": 0.3, "y": 0.3})),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    let base = mock();
+    let mut dev = TestDevice::new(&base);
+    // 1 = the first look of the run, 2 = the screen after the first tap.
+    dev.fail_screenshot = Some(2);
+    agent_on(
+        p.clone(),
+        dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    let reqs = p.requests();
+    let (t, err) = &last_results(&reqs[1])[0];
+    assert!(*err && t.contains("no screenshot"), "{t}");
+    assert!(last_results(&reqs[2])[0].0.contains("Call `look` first"));
+    assert!(!last_results(&reqs[3])[0].1);
+    assert!(!last_results(&reqs[4])[0].1);
+    assert_eq!(base.calls().len(), 2, "the refused tap did not run");
+}
+
+#[tokio::test]
+async fn empty_turn_gets_a_placeholder() {
+    let p = Scripted::new(vec![
+        reply(vec![], StopReason::EndTurn),
+        call("done", json!({"summary": "ok"})),
+    ]);
+    agent(
+        p.clone(),
+        &mock(),
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("x")
+    .await;
+    let reqs = p.requests();
+    let m = &reqs[1].messages[1];
+    assert_eq!(m.role, Role::Assistant);
+    assert_eq!(m.content, vec![ContentBlock::text("(no response)")]);
 }

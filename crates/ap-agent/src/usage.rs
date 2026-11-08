@@ -19,6 +19,9 @@ pub struct UsageLog {
     pub total: Usage,
     /// Sum of known step costs; `None` if no step had a known price.
     pub total_cost_usd: Option<f64>,
+    /// LLM calls cancelled while in flight (take-over). The provider may still
+    /// bill them, but their usage is unknown, so the totals are a lower bound.
+    pub cancelled_calls: u32,
 }
 
 impl UsageLog {
@@ -44,8 +47,12 @@ impl UsageLog {
             .total_cost_usd
             .map(|c| format!(", ~${c:.4}"))
             .unwrap_or_default();
+        let cancelled = match self.cancelled_calls {
+            0 => String::new(),
+            n => format!(" (+{n} cancelled call not counted; the cost is a lower bound)"),
+        };
         format!(
-            "{} calls, input {} (cache read {}, cache write {}), output {}{cost}",
+            "{} calls, input {} (cache read {}, cache write {}), output {}{cost}{cancelled}",
             self.steps.len(),
             t.total_input(),
             t.cache_read_input_tokens,

@@ -15,9 +15,17 @@
 //! - [`UsageLog`]: tokens and estimated cost per step.
 //!
 //! Safety rules (from upstream phoneuse): the model must call `confirm`
-//! and the host must approve before any action marked `irreversible`;
-//! unlocking needs `allow_unlock` *and* the owner's approval, and the
-//! passcode never reaches the model; the run stops at `max_steps`.
+//! and the host must approve before any action marked `irreversible`, and
+//! before actions the host itself classifies as risky (Enter, text with a
+//! newline, a tap right after typing in a messaging, payment or unknown app).
+//! An approval allows exactly one named call, the next one; a denial blocks
+//! everything except `home` / `back` until the owner speaks again. Digit runs
+//! of 4 or more (a possible passcode) need the owner's approval, and while
+//! the phone looks locked no text or keys are sent. Unlocking needs
+//! `allow_unlock` *and* the owner's approval, and the passcode never reaches
+//! the model; the run stops at `max_steps`. These rules reduce risk; they
+//! depend partly on the model and on screen hints, so take-over (cancel)
+//! remains the hard stop.
 
 mod agent;
 mod cancel;
