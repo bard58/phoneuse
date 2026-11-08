@@ -12,9 +12,12 @@ rights. It needs a USB cable one time. After the setup, it can also use Wi-Fi.
 ## Requirements
 
 - An iPhone with iOS 17.4 or later. iOS 17.3 and earlier are not supported.
-  Touch and keyboard input need iOS 27 or later. On iOS 17.4 to 26.x, the
-  iPhone refuses the display stream (CoreDevice error 9021), and only
-  screenshots can work.
+  Touch and keyboard input need an iOS 27 release build or later. Early
+  iOS 27 betas list no HID service. Below iOS 27, the iPhone refuses the
+  display stream with CoreDevice error 9021 (reported on iOS 18 and 26,
+  expected on 17.x), and only screenshots can work.
+- Models newer than `iPhone18,5` can need a Cryptex1 developer disk image
+  for input. agentphone does not support Cryptex1 yet.
 - iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
   touch input does not work, because these models cannot get iOS 27.
 - A USB data cable (the cable in the box is correct).
@@ -138,16 +141,27 @@ The self-test does these steps in order:
    the folder.
 4. Only after you type `y`, it presses Home, swipes one time from left to
    right on the home screen, and presses Home again. After each action, it
-   compares a new screenshot with the previous one. It does not type text and
-   does not tap.
+   compares a new screenshot with the previous one. Only a big change counts:
+   a clock tick or a live widget does not. It does not type text and does
+   not tap.
+   - Touch input needs iOS 27 or later. On iOS below 27, the test skips these
+     three steps and gives the reason.
+   - The swipe is sent only when there is proof that the home screen shows:
+     Home changed the screen, or you answer yes to the question "Is the home
+     screen showing on the phone now?". Without proof, the test skips the
+     swipe. If Home fails, the test skips the swipe too.
+   - If the second Home does not change the screen, the step passes. The
+     swipe can end on the first home page, where Home does nothing.
 
 Each step shows PASS, FAIL, or SKIP, one reason, and one fix. The test also
-writes `selftest-report.txt`. The report contains no secrets and only the
-last 4 characters of the UDID. Press Ctrl+C to stop the test. The report
+writes `selftest-report.txt`. The report contains no secrets and no phone
+names. It shows only the last 4 characters of a UDID or a serial. Press Ctrl+C to stop the test. The report
 then keeps the results until that point.
 
-`--yes` starts the input test without the question. Without a terminal and
-without `--yes`, the input test is skipped. The exit code is 0 when all steps
+`--yes` starts the input test without the questions. With `--yes`, the
+swipe is sent only when Home changes the screen. To get this change, open an
+app (for example Settings) before you start. Without a terminal and without
+`--yes`, the input test is skipped. The exit code is 0 when all steps
 that ran pass, and 1 when a step fails or you press Ctrl+C.
 
 For a single manual test, use these commands:
@@ -216,11 +230,14 @@ problem, then run `agentphone doctor` again.
 - Typing uses a US keyboard layout. For text with accents, other scripts, or
   emoji, agentphone puts the text on the pasteboard and sends Cmd+V. This
   fallback is unverified.
-- Touch and keyboard input need iOS 27 or later. On iOS 17.4 to 26.x, the
-  iPhone refuses the display stream with CoreDevice error 9021. This includes
-  every iPhone XS, XS Max, and XR, because they stop at iOS 18. The
-  `hid_services` check can pass on these versions, because the services
-  exist, but input still fails.
+- Touch and keyboard input need iOS 27 or later. Below iOS 27, the iPhone
+  refuses the display stream with CoreDevice error 9021 (reported on iOS 18
+  and 26, expected on 17.x). This includes every iPhone XS, XS Max, and XR,
+  because they stop at iOS 18. The `hid_services` check looks only for the
+  services. It can pass on these versions while input fails.
+- Models newer than `iPhone18,5` can need a Cryptex1 developer disk image.
+  agentphone does not support Cryptex1 yet, so input can fail on these
+  models.
 - iOS has no query for the open app on this route. agentphone knows the app
   only right after `open_app`. After any input, the app is unknown.
 - A later iOS version can refuse the display service that agentphone opens

@@ -15,9 +15,12 @@ agentphone is early software. Read this before you use it.
 - Nobody tested agentphone on a real phone yet. Every device path (iPhone and
   Android) is unverified.
 - iPhone touch input uses the CoreDevice HID services. Public reports show
-  that these services accept input only on iOS 27 and later. On iOS 17.4 to
-  26.x, the iPhone refuses the display stream (CoreDevice error 9021), so
-  touch and keyboard input do not work there. Screenshots can still work.
+  that these services accept input only on iOS 27 release builds and later
+  (early iOS 27 betas list no HID service). The iPhone refuses the display
+  stream with CoreDevice error 9021. This is reported on iOS 18 and 26, and
+  expected on 17.x. Thus touch and keyboard input do not work on iOS 17.4 to
+  26.x. Screenshots can still work. Models newer than `iPhone18,5` can need a
+  Cryptex1 developer disk image, which agentphone does not support yet.
   `agentphone doctor` shows the services as the "Touch and keyboard input"
   check.
 - Report problems in the issue tracker of
@@ -71,7 +74,7 @@ See [docs/agent.md](docs/agent.md#safety-rules) for the full rules.
 
 | Phone | Requirement | Connection | Status |
 |---|---|---|---|
-| iPhone 11 and newer | iOS 17.4 or later, Developer Mode, one USB pairing. Touch input needs iOS 27 or later. | USB, then Wi-Fi | unverified on a device |
+| iPhone 11 and newer | iOS 17.4 or later, Developer Mode, one USB pairing. Touch input needs an iOS 27 release build or later. Models newer than `iPhone18,5` can need a Cryptex1 disk image, which agentphone does not support yet. | USB, then Wi-Fi | unverified on a device |
 | iPhone 13 | iOS 17.4 to 27. Touch input needs iOS 27. | USB, then Wi-Fi | target model, unverified on a device |
 | iPhone XS, XS Max, XR | iOS 17.4 to 18 (the last iOS for these models), Developer Mode, one USB pairing | USB, then Wi-Fi | agentphone connects, but touch input does not work, because these models cannot get iOS 27. Screenshots can work without input. Unverified on a device. |
 | iPhone with iOS 17.3 or earlier | not supported. Update iOS. | - | - |
@@ -91,7 +94,7 @@ agentphone needs no administrator rights.
 |---|---|
 | `agentphone setup [ios\|android\|llm\|mcp\|ocr]` | Step-by-step setup. You can run it again. |
 | `agentphone doctor` | Examines the setup and prints one fix for each problem. |
-| `agentphone selftest [--out DIR] [--yes]` | First-run test on the phone: setup, connection, screenshot, then Home and one swipe after you answer y. Writes `selftest-report.json` for the developer. |
+| `agentphone selftest [--out DIR] [--yes]` | First-run test on the phone: setup, connection, screenshot, then Home and one swipe after you answer y. The swipe is sent only on the home screen. On iOS below 27 the input test is skipped. Writes `selftest-report.json` for the developer. |
 | `agentphone devices`, `use <id>`, `info` | Lists phones, sets the default phone, shows details. |
 | `agentphone screenshot [-o FILE] [--grid]` | Saves a PNG of the screen. |
 | `agentphone tap X Y`, `long-press X Y`, `swipe X1 Y1 X2 Y2` | Touch input. X and Y are fractions from 0 to 1. Add `--px` for pixels of the saved screenshot. |

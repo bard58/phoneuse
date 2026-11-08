@@ -13,9 +13,16 @@ on the iPhone. Windows needs the Apple Devices app or iTunes.
 ## Which iPhones work?
 
 agentphone connects to iPhones with iOS 17.4 or later. Touch and keyboard
-input need iOS 27 or later, so use an iPhone 11 or newer with iOS 27. The
-iPhone 13 is a main target. On iOS 17.4 to 26.x, the iPhone refuses the
-display stream (CoreDevice error 9021), and only screenshots can work.
+input need iOS 27 or later, so use an iPhone 11 or newer with an iOS 27
+release build. Early iOS 27 betas list no HID service. The iPhone 13 is a
+main target. Below iOS 27, the iPhone refuses the display stream with
+CoreDevice error 9021 (reported on iOS 18 and 26, expected on 17.x), and
+only screenshots can work.
+
+Models newer than `iPhone18,5` can need a Cryptex1 developer disk image for
+input. agentphone does not support Cryptex1 yet, so input can fail on these
+models. The disk image comes from a public mirror that agentphone does not
+pin, so a change there can also change the result.
 
 iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
 touch input does not work, because these models cannot get iOS 27.

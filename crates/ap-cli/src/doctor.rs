@@ -331,6 +331,15 @@ pub fn ocr_checks() -> Vec<Check> {
 
 /// Run every check.
 pub async fn gather(cfg_path: &Path, wanted: Option<&str>) -> Vec<Check> {
+    gather_with_devices(cfg_path, wanted).await.0
+}
+
+/// Run every check. Also return the phones that discovery found, so that a
+/// caller can remove their ids and names from a report.
+pub async fn gather_with_devices(
+    cfg_path: &Path,
+    wanted: Option<&str>,
+) -> (Vec<Check>, Vec<ap_core::DeviceInfo>) {
     let loaded = crate::config_cmd::load(cfg_path);
     let mut checks = config_checks(cfg_path, loaded.as_ref());
     let cfg = loaded.unwrap_or_default();
@@ -386,7 +395,7 @@ pub async fn gather(cfg_path: &Path, wanted: Option<&str>) -> Vec<Check> {
     }
     checks.extend(ocr_checks());
     relax_unused_platforms(&mut checks, &found.devices);
-    checks
+    (checks, found.devices)
 }
 
 /// When a phone works, problems on the other platform are only warnings

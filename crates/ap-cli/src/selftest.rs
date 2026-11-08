@@ -4,11 +4,15 @@
 //! connection, one screenshot, then a harmless input test. The input test
 //! runs only after the owner answers yes (or gives `--yes`). It presses Home,
 //! does one swipe on the home screen, and presses Home again. It never types
-//! text and never taps.
+//! text and never taps. The swipe is sent only when there is proof that the
+//! home screen shows (see [`input_steps`]). On iOS below 27 the input test is
+//! skipped, because touch input needs iOS 27.
 //!
 //! Each step gives PASS, FAIL or SKIP with one reason and one fix. At the end
 //! the command writes `selftest-report.json` and `selftest-report.txt`. The
-//! report holds no secrets and only the last 4 characters of the device id.
+//! report holds no secrets and no phone names. It shows only the last 4
+//! characters of a device id. [`redact`] removes the ids and names of every
+//! phone that discovery found.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +38,13 @@ pub const STEPS: [(&str, &str); 6] = [
 
 /// The input test steps.
 const INPUT_STEPS: [&str; 3] = ["home", "swipe", "home_again"];
+
+/// Touch input on an iPhone needs this iOS major version or later. Below it,
+/// the iPhone refuses the display stream, and `Input::open` fails.
+pub const IOS_INPUT_MAJOR: u32 = 27;
+
+/// The text that replaces a phone name in the report.
+pub const NAME_MASK: &str = "[phone name]";
 
 /// The swipe of the input test: a finger from left to right in the middle of
 /// the screen. On the home screen it opens the previous page or the widgets.
@@ -124,6 +135,7 @@ impl Step {
 }
 
 /// The phone, without personal data: no name, only the end of the id.
+/// [`Report::finish`] also removes the names from the step texts.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PhoneSummary {
     pub platform: String,
@@ -215,10 +227,11 @@ impl Report {
         !self.stopped_by_user && !self.steps.iter().any(|s| s.result == Outcome::Fail)
     }
 
-    /// Remove personal data from every text: known device ids, UDID-like
-    /// tokens, and the home folder path. Then update the counts.
-    pub fn finish(&mut self, known_ids: &[&str], home: Option<&str>) {
-        let clean = |t: &str| redact(t, known_ids, home);
+    /// Remove personal data from every text: known device ids, known phone
+    /// names, UDID-like tokens, and the home folder path. Then update the
+    /// counts.
+    pub fn finish(&mut self, known_ids: &[&str], names: &[&str], home: Option<&str>) {
+        let clean = |t: &str| redact(t, known_ids, names, home);
         for s in &mut self.steps {
             s.reason = clean(&s.reason);
             s.fix = s.fix.as_deref().map(clean);
@@ -283,11 +296,31 @@ fn looks_like_udid(t: &str) -> bool {
         && t.chars().filter(|c| c.is_ascii_digit()).count() >= 8
 }
 
+/// A phone name that is personal. The default names ("iPhone") and very
+/// short names are not, and a replacement would change normal words.
+fn is_personal_name(name: &str) -> bool {
+    let n = name.trim();
+    n.chars().count() >= 3
+        && !["iphone", "ipad", "android", "phone"]
+            .iter()
+            .any(|g| n.eq_ignore_ascii_case(g))
+}
+
 /// Remove personal data from a text. See [`Report::finish`].
-pub fn redact(text: &str, known_ids: &[&str], home: Option<&str>) -> String {
+pub fn redact(text: &str, known_ids: &[&str], names: &[&str], home: Option<&str>) -> String {
     let mut t = text.to_string();
     if let Some(h) = home.filter(|h| h.len() > 3) {
         t = t.replace(h, "~");
+    }
+    // The longest name first: "Ozan's iPhone 13" before "Ozan's iPhone".
+    let mut names: Vec<&str> = names
+        .iter()
+        .map(|n| n.trim())
+        .filter(|n| is_personal_name(n))
+        .collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for n in names {
+        t = t.replace(n, NAME_MASK);
     }
     for id in known_ids.iter().filter(|i| i.len() > 4) {
         t = t.replace(id, &mask_id(id));
@@ -350,6 +383,11 @@ pub fn step_text(s: &Step, color: bool) -> String {
 /// The report under construction, and where the step lines go.
 pub struct Session {
     pub report: Report,
+    /// Ids of every phone seen in this run. They are not in the report:
+    /// [`Report::finish`] removes them from the texts.
+    pub ids: Vec<String>,
+    /// Names of every phone seen in this run, for the same purpose.
+    pub names: Vec<String>,
     /// Print each step when it completes.
     pub echo: bool,
     /// Print to stderr (stdout carries the JSON with `--json`).
@@ -363,6 +401,8 @@ impl Session {
     pub fn quiet() -> Self {
         Self {
             report: Report::new(),
+            ids: Vec::new(),
+            names: Vec::new(),
             echo: false,
             to_stderr: false,
             color: false,
@@ -386,16 +426,19 @@ impl Session {
         self.report.count();
     }
 
-    pub fn has(&self, id: &str) -> bool {
-        self.report.steps.iter().any(|s| s.id == id)
+    /// Remember the id and the name of a phone, so that the report does
+    /// not show them. A name that is the same as the model is not personal.
+    pub fn remember(&mut self, info: &DeviceInfo) {
+        if !info.id.is_empty() {
+            self.ids.push(info.id.clone());
+        }
+        if info.name != info.model {
+            self.names.push(info.name.clone());
+        }
     }
 
-    fn result(&self, id: &str) -> Option<Outcome> {
-        self.report
-            .steps
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.result)
+    pub fn has(&self, id: &str) -> bool {
+        self.report.steps.iter().any(|s| s.id == id)
     }
 
     /// Add a SKIP for every step that has no result yet.
@@ -550,6 +593,8 @@ enum Seen {
     /// The action failed.
     Error(anyhow::Error),
     /// The action was sent. `None`: no screenshot, so the change is unknown.
+    /// `Some((big, fraction))`: `big` is true when the screen before and
+    /// after the action differs by at least `big_fraction`.
     Sent(Option<(bool, f32)>),
 }
 
@@ -583,9 +628,55 @@ async fn act(
     }
     let cfg = t.config().clone();
     let fraction = before.map_or(1.0, |b| changed_fraction(&b, &settled.frame, &cfg));
-    let changed = since.is_some_and(|n| settled.seq > n) || fraction > cfg.change_fraction;
-    Seen::Sent(Some((changed, fraction)))
+    // Only a big difference counts. A clock tick, a live widget or a Live
+    // Activity also increments `seq` and can pass `change_fraction`, but it
+    // does not prove that the action arrived.
+    Seen::Sent(Some((is_big_change(fraction, &cfg), fraction)))
 }
+
+/// True when `fraction` of the screen changed is enough to prove that an
+/// action arrived: a new page or a new app, not a small ambient change.
+pub fn is_big_change(fraction: f32, cfg: &SettleConfig) -> bool {
+    fraction >= cfg.big_fraction
+}
+
+/// True for the bundle id or package name of a home screen app.
+pub fn is_home_app(id: &str) -> bool {
+    let id = id.trim().to_ascii_lowercase();
+    id == "com.apple.springboard" || id == "com.miui.home" || id.contains("launcher")
+}
+
+/// The iOS version of an iPhone that cannot get touch input, or `None`.
+/// An unknown version gives `None`: the input test then shows the result.
+pub fn ios_without_input(info: &DeviceInfo) -> Option<&str> {
+    if info.platform != Platform::Ios {
+        return None;
+    }
+    let major = info
+        .os_version
+        .trim()
+        .split('.')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    (major < IOS_INPUT_MAJOR).then_some(info.os_version.as_str())
+}
+
+/// The SKIP plan for an iPhone below iOS 27, or `None`.
+pub fn input_gate(info: &DeviceInfo) -> Option<InputPlan> {
+    let v = ios_without_input(info)?;
+    Some(InputPlan::Skip {
+        reason: format!(
+            "touch input needs iOS {IOS_INPUT_MAJOR} or later, and this iPhone has iOS {v}"
+        ),
+        fix: format!(
+            "update the iPhone to iOS {IOS_INPUT_MAJOR} or later (a release build, not an early beta). Screenshots can work without it"
+        ),
+    })
+}
+
+/// Asks the owner if the home screen shows. `None` when the prompt fails.
+pub type AskHome = fn() -> Option<bool>;
 
 fn percent(f: f32) -> String {
     format!("{:.0}% of the screen", (f * 100.0).clamp(0.0, 100.0))
@@ -595,8 +686,16 @@ const AFTER_FAIL: &str = "fix the FAIL step above, then run `agentphone selftest
 
 const NO_CHANGE_FIX: &str = "unlock the phone, go to the home screen, then run `agentphone selftest` again. If the screen still does not change, send the report to the developer";
 
+const NO_HOME_FIX: &str = "open an app on the phone (for example Settings), then run `agentphone selftest` again. Home must then change the screen";
+
 /// The input test: Home, one swipe, Home again. Uses only these three
 /// actions. `before` is the screenshot of the screenshot step.
+///
+/// The swipe is sent only when there is proof that the home screen shows:
+/// Home changed the screen, the backend reports a home screen app, or the
+/// owner answers yes to `ask_home`. Without proof, the swipe and the second
+/// Home are skipped, because a swipe in an app or on the lock screen can do
+/// an action (mark as read, archive, open a notification).
 pub async fn input_steps(
     s: &mut Session,
     d: &dyn Device,
@@ -604,8 +703,10 @@ pub async fn input_steps(
     before: Option<Frame>,
     cfg: SettleConfig,
     dir: &Path,
+    ask_home: Option<AskHome>,
 ) {
-    if let InputPlan::Skip { reason, fix } = plan {
+    let gate = input_gate(d.info());
+    if let InputPlan::Skip { reason, fix } = gate.as_ref().unwrap_or(plan) {
         for id in INPUT_STEPS {
             s.add(Step::skip(id, reason.clone()).with_fix(fix.clone()));
         }
@@ -618,64 +719,102 @@ pub async fn input_steps(
     });
 
     // 1. Home. The phone can be on the home screen already, so no change is
-    //    not a failure here.
+    //    not a failure here. But only a change proves that the home screen
+    //    shows now.
+    let home_proof;
     let step = match act(s, d, &mut settler, dir, "after-home.png", d.home()).await {
-        Seen::Error(e) => Step::fail("home", "the phone did not accept the Home button")
-            .with_fix("run `agentphone doctor`, then send the report to the developer")
-            .with_error(&e),
-        Seen::Sent(None) => Step::pass(
-            "home",
-            "sent; no screenshot, so the screen change is unknown",
-        ),
-        Seen::Sent(Some((true, f))) => {
-            Step::pass("home", format!("sent, the screen changed ({})", percent(f)))
-        }
-        Seen::Sent(Some((false, _))) => Step::pass(
-            "home",
-            "sent, the screen did not change (the phone was on the home screen, or the press did not arrive)",
-        ),
-    };
-    s.add(step);
-
-    // 2. Swipe from left to right. On the home screen this must change the screen.
-    let swipe = d.swipe(SWIPE_FROM, SWIPE_TO, Duration::from_millis(SWIPE_MS));
-    let swipe_changed;
-    let step = match act(s, d, &mut settler, dir, "after-swipe.png", swipe).await {
         Seen::Error(e) => {
-            swipe_changed = false;
-            Step::fail("swipe", "the phone did not accept the swipe")
-                .with_fix("run `agentphone doctor`, then send the report to the developer")
-                .with_error(&e)
+            s.add(
+                Step::fail("home", "the phone did not accept the Home button")
+                    .with_fix("run `agentphone doctor`, then send the report to the developer")
+                    .with_error(&e),
+            );
+            for id in ["swipe", "home_again"] {
+                s.add(
+                    Step::skip(id, "Home failed, so the swipe was not sent").with_fix(AFTER_FAIL),
+                );
+            }
+            return;
         }
         Seen::Sent(None) => {
-            swipe_changed = false;
+            home_proof = false;
             Step::pass(
-                "swipe",
+                "home",
                 "sent; no screenshot, so the screen change is unknown",
             )
         }
         Seen::Sent(Some((true, f))) => {
-            swipe_changed = true;
-            Step::pass(
-                "swipe",
-                format!("sent, the screen changed ({})", percent(f)),
-            )
+            home_proof = true;
+            Step::pass("home", format!("sent, the screen changed ({})", percent(f)))
         }
         Seen::Sent(Some((false, _))) => {
-            swipe_changed = false;
-            Step::fail("swipe", "sent, but the screen did not change").with_fix(NO_CHANGE_FIX)
+            home_proof = false;
+            Step::pass(
+                "home",
+                "sent, the screen did not change (the phone was on the home screen, or the press did not arrive)",
+            )
         }
     };
     s.add(step);
 
-    // 3. Home again: it must undo the swipe. Without a visible swipe, this
-    //    test cannot show anything, but Home still goes back to a known screen.
+    // Proof that the home screen shows, before the swipe.
+    let mut on_home =
+        home_proof || matches!(d.foreground_app().await, Ok(Some(app)) if is_home_app(&app));
+    if !on_home && let Some(ask) = ask_home {
+        on_home = tokio::task::spawn_blocking(ask)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+    }
+    if !on_home {
+        let (reason, fix) = if ask_home.is_some() {
+            (
+                "you did not confirm the home screen, so the swipe was not sent",
+                "go to the home screen, then run `agentphone selftest` again",
+            )
+        } else {
+            (
+                "no proof that the home screen shows, so the swipe was not sent",
+                NO_HOME_FIX,
+            )
+        };
+        for id in ["swipe", "home_again"] {
+            s.add(Step::skip(id, reason).with_fix(fix));
+        }
+        return;
+    }
+
+    // 2. Swipe from left to right. On the home screen this must change the screen.
+    let swipe = d.swipe(SWIPE_FROM, SWIPE_TO, Duration::from_millis(SWIPE_MS));
+    let step = match act(s, d, &mut settler, dir, "after-swipe.png", swipe).await {
+        Seen::Error(e) => Step::fail("swipe", "the phone did not accept the swipe")
+            .with_fix("run `agentphone doctor`, then send the report to the developer")
+            .with_error(&e),
+        Seen::Sent(None) => Step::pass(
+            "swipe",
+            "sent; no screenshot, so the screen change is unknown",
+        ),
+        Seen::Sent(Some((true, f))) => Step::pass(
+            "swipe",
+            format!("sent, the screen changed ({})", percent(f)),
+        ),
+        Seen::Sent(Some((false, _))) => {
+            Step::fail("swipe", "sent, but the screen did not change").with_fix(NO_CHANGE_FIX)
+        }
+    };
+    let swipe_failed = step.result == Outcome::Fail;
+    s.add(step);
+
+    // 3. Home again: it goes back to a known screen. When the swipe ends on
+    //    the first home page, Home does nothing there, so no change is not a
+    //    failure.
     let result = act(s, d, &mut settler, dir, "after-home-again.png", d.home()).await;
     let step = match result {
         Seen::Error(e) => Step::fail("home_again", "the phone did not accept the Home button")
             .with_fix("run `agentphone doctor`, then send the report to the developer")
             .with_error(&e),
-        _ if !swipe_changed && s.result("swipe") == Some(Outcome::Fail) => Step::skip(
+        _ if swipe_failed => Step::skip(
             "home_again",
             "sent, but the swipe did not change the screen, so this result tells nothing",
         )
@@ -688,9 +827,10 @@ pub async fn input_steps(
             "home_again",
             format!("sent, the screen changed back ({})", percent(f)),
         ),
-        Seen::Sent(Some((false, _))) => {
-            Step::fail("home_again", "sent, but the screen did not change").with_fix(NO_CHANGE_FIX)
-        }
+        Seen::Sent(Some((false, _))) => Step::pass(
+            "home_again",
+            "sent, the screen did not change (the swipe can end on the first home page, where Home does nothing)",
+        ),
     };
     s.add(step);
 }
@@ -711,6 +851,16 @@ pub fn write_report(dir: &Path, report: &Report) -> Result<PathBuf> {
 /// Process exit code: 0 when every step that ran passed.
 pub fn exit_code(report: &Report) -> u8 {
     if report.ok() { 0 } else { 1 }
+}
+
+/// Ask if the home screen shows, when Home gave no proof. `None` when the
+/// prompt fails. The default is no.
+fn ask_home_screen() -> Option<bool> {
+    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Home did not change the screen. Is the home screen showing on the phone now?")
+        .default(false)
+        .interact()
+        .ok()
 }
 
 /// Ask the input question. `None` when the prompt fails.
@@ -734,7 +884,10 @@ async fn run_steps(
     slot: &mut Option<Box<dyn Device>>,
 ) {
     // 1. Setup check.
-    let checks = doctor::gather(cfg_path, wanted).await;
+    let (checks, found) = doctor::gather_with_devices(cfg_path, wanted).await;
+    for info in &found {
+        s.remember(info);
+    }
     let step = doctor_step(&checks);
     let blocked = step.result == Outcome::Fail;
     s.add(step);
@@ -755,6 +908,7 @@ async fn run_steps(
     };
     match devices::connect(&cfg, wanted).await {
         Ok(d) => {
+            s.remember(d.info());
             s.report.phone = Some(PhoneSummary::new(d.info()));
             s.add(connect_step(d.info()));
             *slot = Some(d);
@@ -783,15 +937,22 @@ async fn run_steps(
     }
     let before = screenshot_step(s, d, out).await;
 
-    // 4. Input test, only after a yes.
+    // 4. Input test, only after a yes. Below iOS 27 there is no question.
     let terminal = ui::interactive();
-    let answer = if !yes && terminal {
-        tokio::task::spawn_blocking(ask_input).await.ok().flatten()
-    } else {
-        None
+    let plan = match input_gate(d.info()) {
+        Some(skip) => skip,
+        None => {
+            let answer = if !yes && terminal {
+                tokio::task::spawn_blocking(ask_input).await.ok().flatten()
+            } else {
+                None
+            };
+            input_plan(yes, terminal, answer)
+        }
     };
-    let plan = input_plan(yes, terminal, answer);
-    input_steps(s, d, &plan, before, SettleConfig::default(), out).await;
+    // With `--yes` there is no question about the home screen either.
+    let ask_home: Option<AskHome> = (!yes && terminal).then_some(ask_home_screen as AskHome);
+    input_steps(s, d, &plan, before, SettleConfig::default(), out, ask_home).await;
 }
 
 /// `agentphone selftest`.
@@ -804,6 +965,8 @@ pub async fn command(
 ) -> Result<u8> {
     let mut s = Session {
         report: Report::new(),
+        ids: Vec::new(),
+        names: Vec::new(),
         echo: true,
         to_stderr: json,
         color: !json && console::colors_enabled(),
@@ -831,14 +994,18 @@ pub async fn command(
         s.skip_rest("stopped with Ctrl+C", "run `agentphone selftest` again");
     }
 
-    let mut ids: Vec<String> = slot.iter().map(|d| d.info().id.clone()).collect();
+    if let Some(d) = &slot {
+        s.remember(d.info());
+    }
+    let mut ids = std::mem::take(&mut s.ids);
     ids.extend(wanted.map(str::to_string));
     if let Ok(cfg) = config_cmd::load(cfg_path) {
         ids.extend(cfg.default_device);
     }
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let names: Vec<&str> = s.names.iter().map(String::as_str).collect();
     let home = home_dir();
-    s.report.finish(&ids, home.as_deref());
+    s.report.finish(&ids, &names, home.as_deref());
     let code = exit_code(&s.report);
 
     s.say(&format!("\n{}\n", s.report.summary()));
@@ -877,24 +1044,43 @@ mod tests {
     use ap_core::mock::MockDevice;
     use ap_core::{Button, Capabilities, Gesture, Key, Size, SwipeDirection};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A phone whose screen colour follows the actions it got. With
-    /// `swipe_moves = false`, the swipe arrives but the screen stays the same.
+    /// A phone whose screen colour follows the actions it got. `moves[i]` is
+    /// false when action `i` (0 = Home, 1 = swipe, 2 = Home again) arrives
+    /// but does not change the screen. `ambient` changes one thumbnail cell
+    /// (1/32 of the screen) on every screenshot, like a clock tick. `app` is
+    /// the foreground app that the backend reports.
     struct Screen {
         inner: MockDevice,
-        swipe_moves: bool,
+        moves: [bool; 3],
+        ambient: bool,
+        app: Option<&'static str>,
+        shots: AtomicUsize,
     }
 
     impl Screen {
         fn new(swipe_moves: bool) -> Self {
+            Self::with_moves([true, swipe_moves, true])
+        }
+
+        fn with_moves(moves: [bool; 3]) -> Self {
             let m = MockDevice::new();
             let mut info = m.info().clone();
             info.id = "00008110-001A2B3C4D5E801E".into();
+            info.os_version = "27.0".into();
             info.screen_pixels = Size::new(64.0, 128.0);
             Self {
                 inner: m.with_info(info),
-                swipe_moves,
+                moves,
+                ambient: false,
+                app: None,
+                shots: AtomicUsize::new(0),
             }
+        }
+
+        fn calls(&self) -> Vec<Gesture> {
+            self.inner.calls()
         }
     }
 
@@ -907,19 +1093,19 @@ mod tests {
             self.inner.capabilities()
         }
         async fn screenshot(&self) -> ap_core::Result<Frame> {
-            let n = self
-                .inner
-                .calls()
-                .iter()
-                .filter(|g| self.swipe_moves || matches!(g, Gesture::Button { .. }))
+            let n = (0..self.inner.calls().len())
+                .filter(|i| self.moves.get(*i).copied().unwrap_or(true))
                 .count();
             let v = (40 + 60 * (n % 4)) as u8;
             let s = self.info().screen_pixels;
-            Ok(Frame::solid(
-                s.width as u32,
-                s.height as u32,
-                [v, v, v, 255],
-            ))
+            let mut f = Frame::solid(s.width as u32, s.height as u32, [v, v, v, 255]);
+            let shot = self.shots.fetch_add(1, Ordering::SeqCst);
+            if self.ambient && shot % 2 == 1 {
+                // The thumbnail samples pixel (0, 0) for its first cell.
+                let c = v.wrapping_add(100);
+                f.image.get_pixel_mut(0, 0).0 = [c, c, c, 255];
+            }
+            Ok(f)
         }
         async fn tap(&self, at: Point) -> ap_core::Result<()> {
             self.inner.tap(at).await
@@ -948,6 +1134,9 @@ mod tests {
         async fn launch_app(&self, id: &str) -> ap_core::Result<()> {
             self.inner.launch_app(id).await
         }
+        async fn foreground_app(&self) -> ap_core::Result<Option<String>> {
+            Ok(self.app.map(str::to_string))
+        }
     }
 
     fn fast() -> SettleConfig {
@@ -961,13 +1150,33 @@ mod tests {
         }
     }
 
-    async fn device_part(d: &dyn Device, plan: &InputPlan, dir: &Path) -> Session {
+    /// A mock phone with iOS 27, so that the input test runs.
+    fn mock27(m: MockDevice) -> MockDevice {
+        let mut info = m.info().clone();
+        info.os_version = "27.0".into();
+        m.with_info(info)
+    }
+
+    fn yes() -> Option<bool> {
+        Some(true)
+    }
+
+    fn no() -> Option<bool> {
+        Some(false)
+    }
+
+    async fn device_part(
+        d: &dyn Device,
+        plan: &InputPlan,
+        dir: &Path,
+        ask: Option<AskHome>,
+    ) -> Session {
         let mut s = Session::quiet();
         s.add(Step::pass("doctor", "no problems"));
         s.add(connect_step(d.info()));
         s.report.phone = Some(PhoneSummary::new(d.info()));
         let before = screenshot_step(&mut s, d, dir).await;
-        input_steps(&mut s, d, plan, before, fast(), dir).await;
+        input_steps(&mut s, d, plan, before, fast(), dir, ask).await;
         s
     }
 
@@ -975,11 +1184,15 @@ mod tests {
         s.report.steps.iter().map(|x| (x.id, x.result)).collect()
     }
 
+    fn has_swipe(calls: &[Gesture]) -> bool {
+        calls.iter().any(|g| matches!(g, Gesture::Swipe { .. }))
+    }
+
     #[tokio::test]
     async fn all_steps_pass_and_only_harmless_input_is_sent() {
         let d = Screen::new(true);
         let dir = tempfile::tempdir().unwrap();
-        let mut s = device_part(&d, &InputPlan::Run, dir.path()).await;
+        let mut s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
         use Outcome::Pass;
         assert_eq!(
             results(&s),
@@ -995,7 +1208,7 @@ mod tests {
             s.report.steps
         );
         // Only Home, one swipe, Home: no tap, no text, no app launch.
-        let calls = d.inner.calls();
+        let calls = d.calls();
         assert_eq!(calls.len(), 3, "{calls:?}");
         assert_eq!(
             calls[0],
@@ -1020,7 +1233,7 @@ mod tests {
         ] {
             assert!(dir.path().join(f).exists(), "{f}");
         }
-        s.report.finish(&[], None);
+        s.report.finish(&[], &[], None);
         assert!(s.report.ok());
         assert_eq!(exit_code(&s.report), 0);
         assert_eq!(
@@ -1033,7 +1246,7 @@ mod tests {
     async fn a_swipe_without_effect_fails() {
         let d = Screen::new(false);
         let dir = tempfile::tempdir().unwrap();
-        let mut s = device_part(&d, &InputPlan::Run, dir.path()).await;
+        let mut s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
         let r = results(&s);
         assert_eq!(r[3], ("home", Outcome::Pass));
         assert_eq!(r[4], ("swipe", Outcome::Fail));
@@ -1045,8 +1258,151 @@ mod tests {
                 .unwrap()
                 .contains("home screen")
         );
-        s.report.finish(&[], None);
+        s.report.finish(&[], &[], None);
         assert_eq!(exit_code(&s.report), 1);
+    }
+
+    /// A clock tick or a live widget during the wait is not a swipe result.
+    #[tokio::test]
+    async fn an_ambient_change_does_not_pass_the_swipe() {
+        let mut d = Screen::new(false);
+        d.ambient = true;
+        let dir = tempfile::tempdir().unwrap();
+        let s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
+        let r = results(&s);
+        assert_eq!(r[3], ("home", Outcome::Pass), "{:#?}", s.report.steps);
+        assert_eq!(r[4], ("swipe", Outcome::Fail), "{:#?}", s.report.steps);
+        // The small change is real, but it is below `big_fraction`.
+        let cfg = fast();
+        assert!(1.0 / 32.0 > cfg.change_fraction);
+        assert!(!is_big_change(1.0 / 32.0, &cfg));
+        assert!(is_big_change(0.5, &cfg));
+    }
+
+    /// Home failed: the swipe is never sent.
+    #[tokio::test]
+    async fn a_home_error_skips_the_swipe() {
+        let m = mock27(MockDevice::new().with_capabilities(Capabilities {
+            screenshot: true,
+            ..Capabilities::NONE
+        }));
+        let mut info = m.info().clone();
+        info.screen_pixels = Size::new(32.0, 64.0);
+        let m = m.with_info(info);
+        let dir = tempfile::tempdir().unwrap();
+        let s = device_part(&m, &InputPlan::Run, dir.path(), Some(yes)).await;
+        let r = results(&s);
+        assert_eq!(r[3], ("home", Outcome::Fail));
+        assert_eq!(r[4], ("swipe", Outcome::Skip));
+        assert_eq!(r[5], ("home_again", Outcome::Skip));
+        assert!(
+            s.report.steps[3]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot do this")
+        );
+        assert!(s.report.steps[4].reason.contains("Home failed"));
+        assert!(!has_swipe(&m.calls()), "{:?}", m.calls());
+    }
+
+    /// Home did not change the screen and nobody can confirm the home
+    /// screen: the swipe is not sent.
+    #[tokio::test]
+    async fn no_proof_of_the_home_screen_skips_the_swipe() {
+        let d = Screen::with_moves([false, true, true]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
+        let r = results(&s);
+        assert_eq!(r[3], ("home", Outcome::Pass));
+        assert_eq!(r[4], ("swipe", Outcome::Skip));
+        assert_eq!(r[5], ("home_again", Outcome::Skip));
+        assert!(s.report.steps[4].reason.contains("no proof"));
+        assert!(
+            s.report.steps[4]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("open an app")
+        );
+        assert_eq!(d.calls().len(), 1, "{:?}", d.calls());
+        s.report.finish(&[], &[], None);
+        assert_eq!(exit_code(&s.report), 0);
+
+        // The owner answers no: the swipe is not sent.
+        let d = Screen::with_moves([false, true, true]);
+        let s = device_part(&d, &InputPlan::Run, dir.path(), Some(no)).await;
+        assert_eq!(results(&s)[4], ("swipe", Outcome::Skip));
+        assert!(s.report.steps[4].reason.contains("did not confirm"));
+        assert!(!has_swipe(&d.calls()));
+
+        // The owner answers yes: the swipe is sent.
+        let d = Screen::with_moves([false, true, true]);
+        let s = device_part(&d, &InputPlan::Run, dir.path(), Some(yes)).await;
+        assert_eq!(results(&s)[4], ("swipe", Outcome::Pass));
+        assert_eq!(d.calls().len(), 3);
+    }
+
+    /// The backend reports the launcher: that is proof of the home screen.
+    #[tokio::test]
+    async fn a_home_screen_app_is_proof() {
+        let mut d = Screen::with_moves([false, true, true]);
+        d.app = Some("com.sec.android.app.launcher");
+        let dir = tempfile::tempdir().unwrap();
+        let s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
+        assert_eq!(results(&s)[4], ("swipe", Outcome::Pass));
+        assert!(has_swipe(&d.calls()));
+
+        let mut d = Screen::with_moves([false, true, true]);
+        d.app = Some("com.google.android.gm");
+        let s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
+        assert_eq!(results(&s)[4], ("swipe", Outcome::Skip));
+        assert!(!has_swipe(&d.calls()));
+
+        assert!(is_home_app("com.apple.springboard"));
+        assert!(is_home_app("com.google.android.apps.nexuslauncher"));
+        assert!(is_home_app("com.miui.home"));
+        assert!(!is_home_app("com.apple.mobilemail"));
+    }
+
+    /// The swipe ends on the first home page, where Home does nothing.
+    #[tokio::test]
+    async fn home_again_without_change_passes() {
+        let d = Screen::with_moves([true, true, false]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
+        let r = results(&s);
+        assert_eq!(r[4], ("swipe", Outcome::Pass));
+        assert_eq!(r[5], ("home_again", Outcome::Pass));
+        assert!(s.report.steps[5].reason.contains("first home page"));
+        s.report.finish(&[], &[], None);
+        assert_eq!(exit_code(&s.report), 0);
+    }
+
+    /// Below iOS 27 the input test is skipped and sends nothing.
+    #[tokio::test]
+    async fn ios_below_27_skips_the_input_test() {
+        let m = MockDevice::new();
+        assert_eq!(m.info().os_version, "26.0");
+        let dir = tempfile::tempdir().unwrap();
+        let s = device_part(&m, &InputPlan::Run, dir.path(), Some(yes)).await;
+        let skips: Vec<&Step> = s.report.steps[3..].iter().collect();
+        assert!(skips.iter().all(|x| x.result == Outcome::Skip));
+        assert!(skips[0].reason.contains("iOS 27"), "{}", skips[0].reason);
+        assert!(skips[0].reason.contains("26.0"), "{}", skips[0].reason);
+        assert!(m.calls().is_empty());
+
+        let mut info = m.info().clone();
+        assert!(input_gate(&info).is_some());
+        for v in ["27.0", "27.0.1", "28.1", "", "beta"] {
+            info.os_version = v.into();
+            assert!(input_gate(&info).is_none(), "{v}");
+        }
+        info.os_version = "17.4".into();
+        assert!(input_gate(&info).is_some());
+        info.platform = Platform::Android;
+        info.os_version = "14".into();
+        assert!(input_gate(&info).is_none());
     }
 
     #[tokio::test]
@@ -1054,8 +1410,8 @@ mod tests {
         let d = Screen::new(true);
         let dir = tempfile::tempdir().unwrap();
         let plan = input_plan(false, false, None);
-        let mut s = device_part(&d, &plan, dir.path()).await;
-        assert!(d.inner.calls().is_empty());
+        let mut s = device_part(&d, &plan, dir.path(), Some(yes)).await;
+        assert!(d.calls().is_empty());
         let skips: Vec<&Step> = s
             .report
             .steps
@@ -1064,49 +1420,85 @@ mod tests {
             .collect();
         assert_eq!(skips.len(), 3);
         assert!(skips[0].fix.as_deref().unwrap().contains("--yes"));
-        s.report.finish(&[], None);
+        s.report.finish(&[], &[], None);
         // SKIP is not a failure.
         assert_eq!(exit_code(&s.report), 0);
     }
 
     #[tokio::test]
     async fn no_screenshots_means_unknown_change() {
-        let m = MockDevice::new().with_capabilities(Capabilities {
+        let m = mock27(MockDevice::new().with_capabilities(Capabilities {
             screenshot: false,
             ..Capabilities::ALL
-        });
+        }));
         let dir = tempfile::tempdir().unwrap();
-        let s = device_part(&m, &InputPlan::Run, dir.path()).await;
+        // Without screenshots, only the owner can confirm the home screen.
+        let s = device_part(&m, &InputPlan::Run, dir.path(), Some(yes)).await;
         let r = results(&s);
         assert_eq!(r[2], ("screenshot", Outcome::Fail));
         assert!(s.report.steps[2].error.is_some());
         assert_eq!(r[4], ("swipe", Outcome::Pass));
         assert!(s.report.steps[4].reason.contains("unknown"));
         assert_eq!(m.calls().len(), 3);
+
+        let m = mock27(MockDevice::new().with_capabilities(Capabilities {
+            screenshot: false,
+            ..Capabilities::ALL
+        }));
+        let s = device_part(&m, &InputPlan::Run, dir.path(), None).await;
+        assert_eq!(results(&s)[4], ("swipe", Outcome::Skip));
+        assert_eq!(m.calls().len(), 1);
     }
 
     #[tokio::test]
-    async fn input_errors_are_failures() {
-        let m = MockDevice::new().with_capabilities(Capabilities {
-            screenshot: true,
-            ..Capabilities::NONE
-        });
-        let mut info = m.info().clone();
-        info.screen_pixels = Size::new(32.0, 64.0);
-        let m = m.with_info(info);
+    async fn a_swipe_error_is_a_failure() {
+        struct NoSwipe(Screen);
+        #[async_trait]
+        impl Device for NoSwipe {
+            fn info(&self) -> &DeviceInfo {
+                self.0.info()
+            }
+            fn capabilities(&self) -> Capabilities {
+                self.0.capabilities()
+            }
+            async fn screenshot(&self) -> ap_core::Result<Frame> {
+                self.0.screenshot().await
+            }
+            async fn tap(&self, at: Point) -> ap_core::Result<()> {
+                self.0.tap(at).await
+            }
+            async fn double_tap(&self, at: Point) -> ap_core::Result<()> {
+                self.0.double_tap(at).await
+            }
+            async fn long_press(&self, at: Point, d: Duration) -> ap_core::Result<()> {
+                self.0.long_press(at, d).await
+            }
+            async fn swipe(&self, _: Point, _: Point, _: Duration) -> ap_core::Result<()> {
+                Err(ap_core::Error::Unsupported("swipe".into()))
+            }
+            async fn scroll(&self, at: Point, d: SwipeDirection, a: f32) -> ap_core::Result<()> {
+                self.0.scroll(at, d, a).await
+            }
+            async fn type_text(&self, t: &str) -> ap_core::Result<()> {
+                self.0.type_text(t).await
+            }
+            async fn key(&self, k: &Key) -> ap_core::Result<()> {
+                self.0.key(k).await
+            }
+            async fn button(&self, b: Button) -> ap_core::Result<()> {
+                self.0.button(b).await
+            }
+            async fn launch_app(&self, id: &str) -> ap_core::Result<()> {
+                self.0.launch_app(id).await
+            }
+        }
+        let d = NoSwipe(Screen::new(true));
         let dir = tempfile::tempdir().unwrap();
-        let s = device_part(&m, &InputPlan::Run, dir.path()).await;
+        let s = device_part(&d, &InputPlan::Run, dir.path(), None).await;
         let r = results(&s);
-        assert_eq!(r[3], ("home", Outcome::Fail));
+        assert_eq!(r[3], ("home", Outcome::Pass));
         assert_eq!(r[4], ("swipe", Outcome::Fail));
-        assert_eq!(r[5], ("home_again", Outcome::Fail));
-        assert!(
-            s.report.steps[3]
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("cannot do this")
-        );
+        assert!(s.report.steps[4].error.is_some());
     }
 
     #[test]
@@ -1162,6 +1554,72 @@ mod tests {
         assert!(!all.contains("R5CX123456"), "{all}");
     }
 
+    /// Phone names and Android serials in error texts do not go into the
+    /// report: the paired check, two connected phones, Wi-Fi.
+    #[test]
+    fn names_and_android_serials_are_removed() {
+        let mut s = Session::quiet();
+        let mut ios = MockDevice::new().info().clone();
+        ios.id = "00008110-001A2B3C4D5E801E".into();
+        ios.name = "Ozan's iPhone".into();
+        let mut android = ios.clone();
+        android.id = "R5CX123456".into();
+        android.name = "Galaxy of Ozan".into();
+        android.platform = Platform::Android;
+        android.model = "SM-S921B".into();
+        let mut plain = android.clone();
+        plain.id = "emulator-5554".into();
+        plain.name = "Pixel 8".into();
+        plain.model = "Pixel 8".into();
+        for i in [&ios, &android, &plain] {
+            s.remember(i);
+        }
+        // A name that is the model is not personal.
+        assert_eq!(s.names, vec!["Ozan's iPhone", "Galaxy of Ozan"]);
+
+        let paired = Check::new(
+            "iPhone",
+            "paired",
+            "Pairing",
+            Status::Fail,
+            "Ozan's iPhone does not trust this computer",
+        );
+        s.add(doctor_step(&[paired]));
+        s.add(
+            Step::fail("connect", "agentphone cannot connect to the phone").with_error(
+                &anyhow::Error::new(ap_core::Error::setup(
+                    "more than one phone is connected: R5CX123456 (Galaxy of Ozan, android), 00008110-001A2B3C4D5E801E (Ozan's iPhone, ios)",
+                    "choose one",
+                )),
+            ),
+        );
+        s.add(Step::fail(
+            "screenshot",
+            "Ozan's iPhone is not reachable over Wi-Fi",
+        ));
+        let ids: Vec<&str> = s.ids.iter().map(String::as_str).collect();
+        let names: Vec<&str> = s.names.iter().map(String::as_str).collect();
+        s.report.finish(&ids, &names, None);
+        let text = s.report.text();
+        let json = serde_json::to_string(&s.report).unwrap();
+        for all in [&text, &json] {
+            for secret in ["Ozan", "R5CX123456", "00008110-001A2B3C4D5E801E"] {
+                assert!(!all.contains(secret), "{secret} in {all}");
+            }
+        }
+        assert!(
+            text.contains("[phone name] does not trust this computer"),
+            "{text}"
+        );
+        assert!(text.contains("****3456 ([phone name], android)"), "{text}");
+
+        // Default names stay: they are not personal and are normal words.
+        assert_eq!(
+            redact("unlock the iPhone", &[], &["iPhone", "ab"], None),
+            "unlock the iPhone"
+        );
+    }
+
     #[test]
     fn skip_rest_fills_missing_steps() {
         let mut s = Session::quiet();
@@ -1182,6 +1640,7 @@ mod tests {
         let t = redact(
             "no phone with id \"R5CX9Z\" at C:\\Users\\Ozan\\x; udid 00008110-001A2B3C4D5E801E, hash 0123456789abcdef0123456789abcdef01234567, model iPhone14,5",
             &["R5CX9Z"],
+            &[],
             Some("C:\\Users\\Ozan"),
         );
         assert_eq!(
@@ -1190,7 +1649,7 @@ mod tests {
         );
         // Normal words and short numbers stay.
         assert_eq!(
-            redact("iOS 26.0, 1170 x 2532 px", &[], None),
+            redact("iOS 26.0, 1170 x 2532 px", &[], &[], None),
             "iOS 26.0, 1170 x 2532 px"
         );
     }
@@ -1211,7 +1670,7 @@ mod tests {
         );
         r.steps
             .push(Step::skip("home", "you answered no").with_fix("answer y"));
-        r.finish(&[&d.info().id], None);
+        r.finish(&[&d.info().id], &[&d.info().name], None);
         assert_eq!((r.passed, r.failed, r.skipped), (2, 1, 1));
         assert!(!r.ok());
 
@@ -1223,7 +1682,7 @@ mod tests {
         assert_eq!(v["tool"], "agentphone");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["phone"]["model"], "iPhone14,5");
-        assert_eq!(v["phone"]["os_version"], "26.0");
+        assert_eq!(v["phone"]["os_version"], "27.0");
         assert_eq!(v["phone"]["id"], "****801E");
         assert_eq!(v["steps"][2]["result"], "FAIL");
         assert_eq!(v["steps"][3]["result"], "SKIP");

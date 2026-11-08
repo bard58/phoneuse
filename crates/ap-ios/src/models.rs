@@ -15,8 +15,11 @@
 //! Sources: Apple tech specs (pixels), useyourloaf.com "iPhone 17 Screen
 //! Sizes" (points and scale), The Apple Wiki and the adamawolf identifier
 //! list (`ProductType`), Apple iOS 26 / iOS 27 compatibility lists (newest
-//! iOS). The `iPhone18,x` and `iPhone19,x` identifiers are from public device
-//! databases and are not verified on a device.
+//! iOS). The `iPhone18,x` identifiers are from public device databases and
+//! are not verified on a device. The iPhone 18 family (`iPhone19,x`) is not
+//! in the table on purpose: its public identifiers do not agree, and a wrong
+//! entry stops the screenshot measurement. These models get their size from
+//! the first screenshot.
 
 use ap_core::Size;
 
@@ -114,9 +117,6 @@ pub const MODELS: &[IphoneModel] = &[
     m!("iPhone18,2", "iPhone 17 Pro Max", 440 x 956, 1320 x 2868, CURRENT),
     m!("iPhone18,4", "iPhone Air", 420 x 912, 1260 x 2736, CURRENT),
     m!("iPhone18,5", "iPhone 17e", 390 x 844, 1170 x 2532, CURRENT),
-    m!("iPhone19,2", "iPhone 18 Pro", 402 x 874, 1206 x 2622, CURRENT),
-    m!("iPhone19,3", "iPhone 18 Pro Max", 440 x 956, 1320 x 2868, CURRENT),
-    m!("iPhone19,7", "iPhone 18 Pro Max", 440 x 956, 1320 x 2868, CURRENT),
 ];
 
 /// Default size for a `ProductType` that is not in [`MODELS`] (iPhone 13).
@@ -243,9 +243,6 @@ mod tests {
             "iPhone18,3",
             "iPhone18,4",
             "iPhone18,5",
-            "iPhone19,2",
-            "iPhone19,3",
-            "iPhone19,7",
         ];
         for id in ids {
             let m = lookup(id).unwrap_or_else(|| panic!("{id} missing"));
@@ -278,6 +275,16 @@ mod tests {
         assert!(sizes_from_screenshot(Size::default()).is_none());
     }
 
+    /// The iPhone 18 family identifiers are not verified. They are not in the
+    /// table, so `IosDevice::connect` measures their screen.
+    #[test]
+    fn unverified_iphone_18_ids_are_measured() {
+        for id in ["iPhone19,1", "iPhone19,2", "iPhone19,3", "iPhone19,7"] {
+            assert!(lookup(id).is_none(), "{id}");
+            assert!(!screen_sizes(id).2, "{id}");
+        }
+    }
+
     /// The screenshot rule gives the table size for every model in the table.
     #[test]
     fn screenshot_rule_matches_table() {
@@ -300,7 +307,7 @@ mod tests {
             assert_eq!(m.pixels.0, m.points.0 * s, "{} width", m.product_type);
             assert_eq!(m.pixels.1, m.points.1 * s, "{} height", m.product_type);
         }
-        assert!(MODELS.len() >= 51);
+        assert!(MODELS.len() >= 48);
         assert!(!lookup("iPhone10,3").unwrap().can_run_supported_ios());
         assert!(lookup("iPhone11,8").unwrap().can_run_supported_ios());
     }
