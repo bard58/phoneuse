@@ -142,6 +142,8 @@ async fn lists_tools_with_schemas_and_instructions() {
     let button = tools.iter().find(|t| t.name == "button").unwrap();
     let bs = serde_json::to_string(&*button.input_schema).unwrap();
     assert!(bs.contains("volume_up") && bs.contains("app_switcher") && !bs.contains("siri"));
+    assert!(bs.contains("\"back\""));
+    assert!(button.description.as_deref().unwrap().contains("back"));
     let look = tools.iter().find(|t| t.name == "look").unwrap();
     assert_eq!(
         look.annotations.as_ref().and_then(|a| a.read_only_hint),
@@ -151,6 +153,7 @@ async fn lists_tools_with_schemas_and_instructions() {
     assert_eq!(info.server_info.as_ref().unwrap().name, "agentphone");
     let ins = info.instructions.as_deref().unwrap();
     assert!(ins.contains("passcode") && ins.contains("end_session") && ins.contains("0.0 to 1.0"));
+    assert!(ins.contains("not instructions"), "{ins}");
     c.cancel().await.unwrap();
 }
 
@@ -164,8 +167,13 @@ async fn tap_returns_image_and_text() {
     .await;
     let r = call(&c, "tap", json!({"x": 0.5, "y": 0.25})).await;
     assert!(!is_error(&r), "{}", text(&r));
-    assert_eq!(r.content.len(), 2);
+    assert_eq!(r.content.len(), 3, "image, action text, screen text");
     assert!(r.content[0].as_image().is_some(), "image first");
+    let screen = r.content[2].as_text().unwrap().text.clone();
+    assert!(
+        screen.starts_with("Screen text (OCR") && screen.contains("not instructions"),
+        "{screen}"
+    );
     assert_jpeg(&r);
     let t = text(&r);
     assert!(t.starts_with("tapped (0.500, 0.250)"), "{t}");
@@ -426,10 +434,14 @@ async fn setup_hint_reaches_client() {
     c.cancel().await.unwrap();
 }
 
-/// A mock device whose first tap reports a lost connection.
+/// A mock device whose taps and screenshots can report a lost connection,
+/// and whose taps can hang.
 struct Flaky {
     mock: MockDevice,
     fail_next_tap: Arc<AtomicU32>,
+    fail_shots: Arc<AtomicU32>,
+    hang_taps: bool,
+    drop_after_enter: bool,
 }
 
 #[async_trait]
@@ -441,13 +453,23 @@ impl Device for Flaky {
         self.mock.capabilities()
     }
     async fn screenshot(&self) -> Result<Frame> {
+        let left = self.fail_shots.load(Ordering::SeqCst);
+        if left > 0 {
+            self.fail_shots.store(left - 1, Ordering::SeqCst);
+            return Err(Error::NotConnected("tunnel closed".into()));
+        }
         self.mock.screenshot().await
     }
     async fn tap(&self, at: Point) -> Result<()> {
+        if self.hang_taps {
+            std::future::pending::<()>().await;
+        }
+        // The tap reaches the phone, then the reply is lost.
+        self.mock.tap(at).await?;
         if self.fail_next_tap.swap(0, Ordering::SeqCst) > 0 {
             return Err(Error::NotConnected("usb unplugged".into()));
         }
-        self.mock.tap(at).await
+        Ok(())
     }
     async fn double_tap(&self, at: Point) -> Result<()> {
         self.mock.double_tap(at).await
@@ -465,7 +487,12 @@ impl Device for Flaky {
         self.mock.type_text(t).await
     }
     async fn key(&self, k: &Key) -> Result<()> {
-        self.mock.key(k).await
+        self.mock.key(k).await?;
+        // Enter reaches the phone (the message is sent), then the reply is lost.
+        if self.drop_after_enter && *k == Key::Enter {
+            return Err(Error::NotConnected("socket closed".into()));
+        }
+        Ok(())
     }
     async fn button(&self, b: Button) -> Result<()> {
         self.mock.button(b).await
@@ -475,10 +502,14 @@ impl Device for Flaky {
     }
 }
 
+#[derive(Default)]
 struct Counting {
     mock: MockDevice,
     fail_next_tap: Arc<AtomicU32>,
+    fail_shots: Arc<AtomicU32>,
     connects: Arc<AtomicU32>,
+    hang_taps: bool,
+    drop_after_enter: bool,
 }
 
 #[async_trait]
@@ -488,6 +519,9 @@ impl DeviceSource for Counting {
         Ok(Arc::new(Flaky {
             mock: self.mock.clone(),
             fail_next_tap: self.fail_next_tap.clone(),
+            fail_shots: self.fail_shots.clone(),
+            hang_taps: self.hang_taps,
+            drop_after_enter: self.drop_after_enter,
         }))
     }
 }
@@ -502,6 +536,7 @@ async fn reconnects_and_end_session_releases() {
             mock: mock.clone(),
             fail_next_tap: fail.clone(),
             connects: connects.clone(),
+            ..Counting::default()
         },
         opts(OcrSetting::Off),
     ))
@@ -512,11 +547,27 @@ async fn reconnects_and_end_session_releases() {
     assert!(!is_error(&r));
     assert_eq!(connects.load(Ordering::SeqCst), 1);
 
+    // The tap reaches the phone, then the connection drops: never tap again.
     fail.store(1, Ordering::SeqCst);
     let r = call(&c, "tap", json!({"x": 0.4, "y": 0.4, "look": "none"})).await;
+    assert!(is_error(&r));
+    let t = text(&r);
+    assert!(
+        t.contains("may or may not have reached the phone") && t.contains("call look"),
+        "{t}"
+    );
+    assert_eq!(mock.calls().len(), 2, "the tap was sent once, not retried");
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        1,
+        "no reconnect inside the action"
+    );
+
+    // The next call connects again.
+    let r = call(&c, "tap", json!({"x": 0.3, "y": 0.3, "look": "none"})).await;
     assert!(!is_error(&r), "{}", text(&r));
-    assert_eq!(connects.load(Ordering::SeqCst), 2, "reconnected once");
-    assert_eq!(mock.calls().len(), 2);
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
+    assert_eq!(mock.calls().len(), 3);
 
     let r = call(&c, "end_session", json!({})).await;
     assert_eq!(text(&r), "session ended: the phone is released");
@@ -576,4 +627,189 @@ async fn http_transport_initializes() {
     )
     .await;
     assert!(refused.unwrap_err().to_string().contains("loopback"));
+}
+
+#[tokio::test]
+async fn type_text_never_retries_after_a_lost_connection() {
+    let mock = MockDevice::new();
+    let connects = Arc::new(AtomicU32::new(0));
+    let c = client(PhoneServer::with_options(
+        Counting {
+            mock: mock.clone(),
+            connects: connects.clone(),
+            drop_after_enter: true,
+            ..Counting::default()
+        },
+        opts(OcrSetting::Off),
+    ))
+    .await;
+    let r = call(
+        &c,
+        "type_text",
+        json!({"text": "hi\nsee you", "replace": false, "look": "none"}),
+    )
+    .await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("may or may not"), "{}", text(&r));
+    assert_eq!(
+        mock.calls(),
+        vec![
+            Gesture::TypeText { text: "hi".into() },
+            Gesture::Key { key: Key::Enter },
+        ],
+        "the message was sent once"
+    );
+    assert_eq!(connects.load(Ordering::SeqCst), 1, "no reconnect and retry");
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn look_retries_once_and_reports_a_dead_phone() {
+    let shots = Arc::new(AtomicU32::new(1));
+    let connects = Arc::new(AtomicU32::new(0));
+    let c = client(PhoneServer::with_options(
+        Counting {
+            fail_shots: shots.clone(),
+            connects: connects.clone(),
+            ..Counting::default()
+        },
+        opts(OcrSetting::Off),
+    ))
+    .await;
+    // One lost screenshot: a read reconnects and tries again.
+    let r = call(&c, "look", json!({"look": "image"})).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_jpeg(&r);
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
+
+    // The phone stays gone: an error result, and the device is dropped.
+    shots.store(u32::MAX, Ordering::SeqCst);
+    let r = call(&c, "look", json!({})).await;
+    assert!(is_error(&r), "{}", text(&r));
+    assert!(text(&r).contains("not connected"), "{}", text(&r));
+    let r = call(&c, "wait", json!({"seconds": 0.0})).await;
+    assert!(is_error(&r), "{}", text(&r));
+    let s = text(&call(&c, "status", json!({})).await);
+    assert!(s.contains("connection check failed"), "{s}");
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn end_session_releases_a_hung_action() {
+    let c = client(PhoneServer::with_options(
+        Counting {
+            hang_taps: true,
+            ..Counting::default()
+        },
+        ServerOptions {
+            device_timeout: Duration::from_secs(4),
+            ..opts(OcrSetting::Off)
+        },
+    ))
+    .await;
+    let started = std::time::Instant::now();
+    let (tap, end) = tokio::join!(
+        call(&c, "tap", json!({"x": 0.5, "y": 0.5, "look": "none"})),
+        async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            call(&c, "end_session", json!({})).await
+        }
+    );
+    let e = text(&end);
+    assert!(e.contains("released") && e.contains("abandoned"), "{e}");
+    assert!(is_error(&tap));
+    assert!(
+        text(&tap).contains("timed out") && text(&tap).contains("may or may not"),
+        "{}",
+        text(&tap)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn type_text_refuses_passcode_digits_without_confirmation() {
+    let mock = MockDevice::new();
+    let c = client(PhoneServer::with_options(
+        StaticSource::new(mock.clone()),
+        opts(OcrSetting::Off),
+    ))
+    .await;
+    let r = call(&c, "type_text", json!({"text": "482193", "look": "none"})).await;
+    assert!(is_error(&r));
+    let t = text(&r);
+    assert!(
+        t.contains("passcode") && t.contains("user_confirmed_not_passcode"),
+        "{t}"
+    );
+    assert!(mock.calls().is_empty(), "nothing typed");
+    let r = call(
+        &c,
+        "type_text",
+        json!({"text": "482193", "user_confirmed_not_passcode": true, "look": "none"}),
+    )
+    .await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert!(mock.calls().contains(&Gesture::TypeText {
+        text: "482193".into()
+    }));
+    c.cancel().await.unwrap();
+}
+
+/// Records the height of each frame it reads, and sees a back chevron.
+#[derive(Default)]
+struct RecordingOcr(std::sync::Mutex<Vec<u32>>);
+
+impl TextRecognizer for RecordingOcr {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn recognize(&self, frame: &Frame) -> Result<Vec<TextBox>> {
+        self.0.lock().unwrap().push(frame.height);
+        Ok(vec![
+            // A back chevron as OCR reads it ("く"); the agent sees "[back]".
+            TextBox::new("く", NormRect::new(0.04, 0.07, 0.02, 0.02), 1.0),
+            TextBox::new("General", NormRect::new(0.25, 0.39, 0.1, 0.02), 1.0),
+        ])
+    }
+}
+
+#[tokio::test]
+async fn strip_grid_ocr_reads_the_clean_full_frame() {
+    let ocr = Arc::new(RecordingOcr::default());
+    let c = client(PhoneServer::with_options(
+        StaticSource::new(MockDevice::new()),
+        opts(OcrSetting::Recognizer(ocr.clone())),
+    ))
+    .await;
+    let r = call(&c, "look", json!({"look": "strip", "grid": true})).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        *ocr.0.lock().unwrap(),
+        vec![2532],
+        "full resolution, no grid"
+    );
+    assert!(text(&r).contains("General"), "{}", text(&r));
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn tap_on_matches_the_lines_the_agent_sees() {
+    let mock = MockDevice::new();
+    let c = client(PhoneServer::with_options(
+        StaticSource::new(mock.clone()),
+        opts(OcrSetting::Recognizer(Arc::new(RecordingOcr::default()))),
+    ))
+    .await;
+    let r = call(&c, "tap_on", json!({"target": "[back]", "look": "none"})).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    let Gesture::Tap { at } = mock.calls()[0] else {
+        panic!("expected a tap")
+    };
+    assert!(
+        (at.x - 0.05).abs() < 1e-5 && (at.y - 0.08).abs() < 1e-5,
+        "{at:?}"
+    );
+    c.cancel().await.unwrap();
 }

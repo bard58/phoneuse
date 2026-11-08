@@ -151,6 +151,11 @@ pub struct TypeTextArgs {
     /// false adds to it.
     #[serde(default)]
     pub replace: Option<bool>,
+    /// Text of 4 to 8 digits looks like a passcode and is refused. Set true
+    /// only when the user asked in chat for exactly these digits and they are
+    /// not a passcode, PIN or password.
+    #[serde(default)]
+    pub user_confirmed_not_passcode: Option<bool>,
     /// Screen to return: "strip" (default), "both", "text", "image" or "none".
     #[serde(default)]
     pub look: Option<Look>,

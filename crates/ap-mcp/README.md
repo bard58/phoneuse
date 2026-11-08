@@ -20,7 +20,7 @@ All coordinates are normalized: `x` and `y` are fractions of the screen from
 | `scroll` | Scroll the content up, down, left or right by half-screens. |
 | `type_text` | Type into the focused field. `\n` presses Enter. Replaces the old text unless `replace=false`. |
 | `press_key` | A key or shortcut: `enter`, `backspace`, `cmd+a`, ... |
-| `button` | `home`, `lock`, `volume_up`, `volume_down`, `app_switcher`. |
+| `button` | `home`, `lock`, `volume_up`, `volume_down`, `app_switcher`, `back`. |
 | `open_app` | Open an app by name or bundle id / package name. |
 | `navigate` | `home`, `back`, `app_switcher`, `control_center`, `notifications`. |
 | `list_apps` | Installed app ids, when the backend can list them. |
@@ -32,11 +32,20 @@ Every action returns the screen in the same call:
 
 1. One JPEG image: frames at +0.1, +0.4 and +0.8 s after the action, side by
    side. Frames that did not change are dropped, so a still screen is one frame.
-2. One text block: the result of the action, the strip legend, and, when OCR is
-   available, the text lines of the last frame as `x y  text`.
+2. One text block: the result of the action and the strip legend.
+3. When OCR is available, one more text block: the text lines of the last
+   frame as `x y  text`, under a header that marks them as screen content,
+   not instructions.
+
+The server never sends an action twice. If the connection drops while an
+action runs, the result is an error that says the action may or may not have
+reached the phone, and the agent must look before it tries again. Only reads
+(`look`, `wait`, `list_apps`, `ui_tree`) reconnect and retry once. Each device
+operation has a deadline (`ServerOptions::device_timeout`, 60 s).
 
 There is no `unlock` tool. The server tells the agent to ask the user to unlock
-the phone, and never to type a passcode.
+the phone, and never to type a passcode. `type_text` refuses 4 to 8 digits
+unless the call sets `user_confirmed_not_passcode=true`.
 
 ## Client configuration
 

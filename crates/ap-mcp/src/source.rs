@@ -91,6 +91,24 @@ impl DeviceSource for ProviderSource {
             let dev = self.providers[i].connect(&info.id).await?;
             return Ok(Arc::from(dev));
         }
+        // Not listed: let each provider resolve the id itself, as the CLI does
+        // (Android connects a Wi-Fi host:port, iOS accepts a UDID prefix).
+        if let Some(id) = &self.device_id {
+            let mut useful: Option<Error> = None;
+            for p in &self.providers {
+                match p.connect(id).await {
+                    Ok(dev) => return Ok(Arc::from(dev)),
+                    Err(Error::DeviceNotFound(_) | Error::Unsupported(_)) => {}
+                    Err(e) => {
+                        tracing::debug!(provider = p.name(), error = %e, "connect by id failed");
+                        useful.get_or_insert(e);
+                    }
+                }
+            }
+            if let Some(e) = useful {
+                return Err(e);
+            }
+        }
         if found.len() > 1 && self.device_id.is_none() {
             let ids: Vec<String> = found
                 .iter()
@@ -128,6 +146,54 @@ impl DeviceSource for ProviderSource {
             Some(id) => format!("providers [{}], device {id}", names.join(", ")),
             None => format!("providers [{}], first device found", names.join(", ")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ap_core::mock::MockDevice;
+
+    /// Lists nothing, but connects one id that it can resolve itself
+    /// (like Android `adb connect host:port`).
+    struct Unlisted {
+        resolves: &'static str,
+    }
+
+    #[async_trait]
+    impl DeviceProvider for Unlisted {
+        fn name(&self) -> &str {
+            "unlisted"
+        }
+        async fn discover(&self) -> Result<Vec<DeviceInfo>> {
+            Ok(Vec::new())
+        }
+        async fn connect(&self, id: &str) -> Result<Box<dyn Device>> {
+            if id == self.resolves {
+                Ok(Box::new(MockDevice::new()))
+            } else {
+                Err(Error::DeviceNotFound(id.into()))
+            }
+        }
+    }
+
+    fn source(id: &str) -> ProviderSource {
+        ProviderSource::new(
+            vec![
+                Arc::new(Unlisted { resolves: "other" }),
+                Arc::new(Unlisted {
+                    resolves: "1.2.3.4:5555",
+                }),
+            ],
+            Some(id.into()),
+        )
+    }
+
+    #[tokio::test]
+    async fn unlisted_id_falls_back_to_provider_connect() {
+        assert!(source("1.2.3.4:5555").connect().await.is_ok());
+        let e = source("nope").connect().await.err().expect("not found");
+        assert!(matches!(e, Error::DeviceNotFound(_)), "{e}");
     }
 }
 
