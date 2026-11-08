@@ -1,6 +1,6 @@
 [package]
 name = "ap-mcp"
-description = "MCP stdio server exposing phone tools (look, tap, swipe, type, ...)."
+description = "MCP server (stdio and streamable HTTP) exposing phone tools: look, tap, swipe, type, ..."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,34 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["http"]
+# Streamable HTTP transport on a loopback address (`serve_http`).
+http = ["rmcp/transport-streamable-http-server", "dep:hyper", "dep:hyper-util"]
+# OCR text lines and `tap_on` (pure-Rust ocrs engine, models downloaded by `agentphone setup ocr`).
+ocr = ["ap-vision/ocr"]
+# `MockSource`: a DeviceSource over ap-core's MockDevice, for tests and demos.
+mock = ["ap-core/mock"]
+
 [dependencies]
 ap-core.workspace = true
 ap-screen.workspace = true
-rmcp.workspace = true
+ap-vision.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 base64.workspace = true
+hyper = { workspace = true, optional = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio", "service", "server"] }
+
+[dev-dependencies]
+ap-core = { workspace = true, features = ["mock"] }
+rmcp = { workspace = true, features = ["client"] }
+tokio.workspace = true
+anyhow.workspace = true
 
 [lints]
 workspace = true
