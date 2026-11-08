@@ -1,0 +1,32 @@
+[package]
+name = "ap-cli"
+description = "The agentphone command-line tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentphone"
+path = "src/main.rs"
+
+[dependencies]
+ap-core.workspace = true
+ap-ios.workspace = true
+ap-android.workspace = true
+ap-hid.workspace = true
+ap-screen.workspace = true
+ap-vision.workspace = true
+ap-llm.workspace = true
+ap-agent.workspace = true
+ap-mcp.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

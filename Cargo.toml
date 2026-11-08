@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["AgentPhone contributors", "Aleksey Smolenchuk (original phoneuse)"]
+repository = "https://github.com/bard58/phoneuse"
+homepage = "https://github.com/bard58/phoneuse"
+readme = "README.md"
+keywords = ["iphone", "android", "automation", "agent", "mcp"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[workspace.dependencies]
+# Internal crates
+ap-core = { path = "crates/ap-core", version = "0.1.0" }
+ap-ios = { path = "crates/ap-ios", version = "0.1.0" }
+ap-android = { path = "crates/ap-android", version = "0.1.0" }
+ap-hid = { path = "crates/ap-hid", version = "0.1.0" }
+ap-screen = { path = "crates/ap-screen", version = "0.1.0" }
+ap-vision = { path = "crates/ap-vision", version = "0.1.0" }
+ap-llm = { path = "crates/ap-llm", version = "0.1.0" }
+ap-agent = { path = "crates/ap-agent", version = "0.1.0" }
+ap-mcp = { path = "crates/ap-mcp", version = "0.1.0" }
+
+# External crates (versions verified 2026-11-08, see docs/ANALYSIS.md section 5)
+# idevice is pre-0.2: pin exactly. Use rustls with the `ring` provider (no OpenSSL, no aws-lc build).
+idevice = { version = "=0.1.68", default-features = false, features = [
+    "ring",
+    "usbmuxd",
+    "tcp",
+    "pair",
+    "rsd",
+    "core_device",
+    "core_device_proxy",
+    "tunnel_tcp_stack",
+    "dvt",
+    "screenshotr",
+    "xctest",
+    "wda",
+    "installation_proxy",
+    "springboardservices",
+    "mobile_image_mounter",
+    "amfi",
+    "tss",
+    "heartbeat",
+    "display_stream",
+] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "process", "signal"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "charset", "system-proxy"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+async-trait = "0.1.92"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.23.1"
+toml = "1.2.1"
+directories = "6.0.0"
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.3"
+futures = "0.3.34"
+adb_client = "3.2.3"
+serialport = "4.10.1"
+mdns-sd = "0.21.7"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

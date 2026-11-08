@@ -1,0 +1,23 @@
+[package]
+name = "ap-mcp"
+description = "MCP stdio server exposing phone tools (look, tap, swipe, type, ...)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+ap-screen.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+[lints]
+workspace = true

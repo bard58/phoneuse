@@ -1,0 +1,18 @@
+[package]
+name = "ap-screen"
+description = "Screen helpers: settle detection (port of phoneuse frames.py), downscaling, frame strips."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+image.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

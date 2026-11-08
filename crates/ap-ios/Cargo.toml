@@ -1,0 +1,24 @@
+[package]
+name = "ap-ios"
+description = "iOS backends: idevice (usbmuxd, RSD, CoreDevice HID, DVT screenshot, XCTest/WDA) and a WDA HTTP fallback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+idevice.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+base64.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

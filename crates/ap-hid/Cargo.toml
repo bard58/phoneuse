@@ -1,0 +1,19 @@
+[package]
+name = "ap-hid"
+description = "Optional serial HID dongle backend (ESP32-S3 BLE/USB HID) and the ported AssistiveTouch gesture model."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+serialport.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

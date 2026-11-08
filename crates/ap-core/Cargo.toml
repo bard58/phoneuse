@@ -1,0 +1,28 @@
+[package]
+name = "ap-core"
+description = "Core types and traits for agentphone: Device trait, geometry, gestures, frames, errors, config."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = ["mock"]
+mock = []
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+image.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

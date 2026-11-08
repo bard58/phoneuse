@@ -1,7 +1,6 @@
-.venv/
-.venv-vision/
-__pycache__/
-*.pyc
-allowed
-telemetry-sessions/
-.venv-mcp/
+/target/
+**/*.rs.bk
+*.pdb
+.env
+.DS_Store
+/dist/

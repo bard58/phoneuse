@@ -1,0 +1,17 @@
+[package]
+name = "ap-vision"
+description = "Optional OCR and visual grounding (feature-gated)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+image.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
