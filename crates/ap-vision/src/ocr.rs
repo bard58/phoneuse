@@ -6,7 +6,7 @@ use ap_core::{Error, Frame, Result, Size};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
 use rten::Model;
 
-use crate::models::{DETECTION_MODEL, RECOGNITION_MODEL};
+use crate::models::{self, DETECTION_MODEL, RECOGNITION_MODEL};
 use crate::{NormRect, TextBox, TextRecognizer};
 
 /// Words further apart than this many line heights become separate boxes, so
@@ -31,20 +31,16 @@ fn other(what: &str, e: impl std::fmt::Display) -> Error {
 }
 
 impl OcrsRecognizer {
-    /// Load the two models from `dir` (see [`crate::models`]).
+    /// Load the two default models from `dir` (see [`crate::models`]). Both
+    /// files are checked against their pinned SHA-256 first; a missing or
+    /// changed file gives an [`Error::Setup`].
     pub fn load(dir: &Path) -> Result<Self> {
-        let det = dir.join(DETECTION_MODEL);
-        let rec = dir.join(RECOGNITION_MODEL);
-        if !det.is_file() || !rec.is_file() {
-            return Err(Error::setup(
-                format!("OCR models not found in {}", dir.display()),
-                "run `agentphone setup ocr` to download them (about 12 MB)",
-            ));
-        }
-        Self::from_files(&det, &rec)
+        models::check_models(dir, &models::default_models())?;
+        Self::from_files(&dir.join(DETECTION_MODEL), &dir.join(RECOGNITION_MODEL))
     }
 
-    /// Load from explicit model paths (`.onnx`).
+    /// Load from explicit model paths (`.onnx`). No checksum check: the
+    /// caller chose these files.
     pub fn from_files(detection: &Path, recognition: &Path) -> Result<Self> {
         let detection_model =
             Model::load_file(detection).map_err(|e| other("cannot load OCR detection model", e))?;
@@ -133,4 +129,33 @@ fn split_line(line: &ocrs::TextLine, size: Size, out: &mut Vec<TextBox>) {
         group.push((word.to_string(), r));
     }
     flush(&mut group, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs real models: `AP_OCR_MODEL_DIR=<dir> cargo test -p ap-vision
+    /// --features ocr -- --ignored`.
+    #[test]
+    #[ignore = "needs downloaded OCR models"]
+    fn load_verifies_real_models() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("AP_OCR_MODEL_DIR").expect("set AP_OCR_MODEL_DIR"),
+        );
+        OcrsRecognizer::load(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_tampered_models() {
+        let d = std::env::temp_dir().join(format!("ap-vision-ocr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(DETECTION_MODEL), b"not a model").unwrap();
+        std::fs::write(d.join(RECOGNITION_MODEL), b"not a model").unwrap();
+        let e = OcrsRecognizer::load(&d).unwrap_err();
+        assert!(e.to_string().contains("checksum mismatch"), "{e}");
+        assert!(e.hint().unwrap().contains("agentphone setup ocr"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

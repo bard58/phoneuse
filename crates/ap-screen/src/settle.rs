@@ -189,7 +189,9 @@ impl Settler {
 }
 
 /// Wait until the screen is still for `quiet_period` (at most `timeout`) and
-/// return the newest frame. On timeout the newest frame is returned anyway.
+/// return the newest frame. On timeout the newest frame is returned anyway,
+/// and this function cannot say so: callers that report the screen state to
+/// a model must use [`settle_with`] and check [`Settled::still`].
 pub async fn settle(
     device: &dyn Device,
     timeout: Duration,

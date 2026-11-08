@@ -25,17 +25,19 @@ const ROW: f32 = 0.012;
 /// mistakes for text); a back chevron near the top-left becomes `[back]`.
 /// Sorted in rows top to bottom, then left to right.
 pub fn screen_lines(boxes: &[TextBox], show_all: bool) -> Vec<TextBox> {
+    // Map the back chevron first: `<`, `‹` and `〈` have no letter or digit,
+    // so the filter below would drop them.
     let mut out: Vec<TextBox> = boxes
         .iter()
-        .filter(|b| {
-            show_all || (b.center().y >= STATUS_BAR && b.text.chars().any(char::is_alphanumeric))
-        })
         .map(|b| {
             let mut b = b.clone();
             if BACK_GLYPHS.contains(&b.text.trim()) && b.center().x < 0.15 {
                 b.text = "[back]".into();
             }
             b
+        })
+        .filter(|b| {
+            show_all || (b.center().y >= STATUS_BAR && b.text.chars().any(char::is_alphanumeric))
         })
         .collect();
     out.sort_by(|a, b| {
@@ -245,6 +247,15 @@ mod tests {
             tb("On", 0.8, 0.30),
             tb("•••", 0.5, 0.70),
         ]
+    }
+
+    #[test]
+    fn ascii_chevrons_become_back() {
+        for g in ["<", "‹", "〈"] {
+            let lines = screen_lines(&[tb(g, 0.05, 0.08), tb(g, 0.9, 0.08)], false);
+            let texts: Vec<&str> = lines.iter().map(|b| b.text.as_str()).collect();
+            assert_eq!(texts, ["[back]"], "glyph {g}");
+        }
     }
 
     #[test]

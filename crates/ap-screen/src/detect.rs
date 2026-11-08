@@ -9,6 +9,13 @@
 //! animated banner) are *dynamic* and ignored, grown by 3 cells so the whole
 //! video rectangle is covered. Page transitions and scroll flings finish well
 //! within that time; video never does.
+//!
+//! Upstream received frames < 50 ms apart. Here frames come from screenshot
+//! polling, and a slow device (Android `screencap`) can need 0.6-1.5 s per
+//! frame. So the detector measures the gap between frames and stretches the
+//! pause and dynamic thresholds to it: `pause` becomes at least 1.5 gaps and
+//! `dynamic_after` at least 2 gaps. Without this, every move on a slow device
+//! counts as "after a pause" and nothing ever becomes dynamic.
 
 use std::time::{Duration, Instant};
 
@@ -149,7 +156,15 @@ pub struct ChangeDetector {
     last_move: Vec<Instant>,
     moving_since: Vec<Instant>,
     dynamic_fraction: f32,
+    prev_at: Option<Instant>,
+    /// Smoothed time between polled frames (gaps longer than [`MAX_POLL_GAP`]
+    /// are idle time between looks and do not count).
+    gap: Option<Duration>,
 }
+
+/// A gap between frames longer than this is idle time (between two settles),
+/// not the polling interval of a slow device.
+const MAX_POLL_GAP: Duration = Duration::from_millis(2500);
 
 impl ChangeDetector {
     pub fn new(cfg: SettleConfig) -> Self {
@@ -160,6 +175,37 @@ impl ChangeDetector {
             last_move: Vec::new(),
             moving_since: Vec::new(),
             dynamic_fraction: 0.0,
+            prev_at: None,
+            gap: None,
+        }
+    }
+
+    /// Smoothed time between polled frames, once measured.
+    pub fn frame_gap(&self) -> Option<Duration> {
+        self.gap
+    }
+
+    /// The pause and dynamic thresholds in use, stretched to the measured
+    /// frame gap: `(pause, dynamic_after)`.
+    pub fn effective_thresholds(&self) -> (Duration, Duration) {
+        let gap = self.gap.unwrap_or_default();
+        (
+            self.cfg.pause.max(gap.mul_f32(1.5)),
+            self.cfg.dynamic_after.max(gap * 2),
+        )
+    }
+
+    fn record_gap(&mut self, now: Instant) {
+        if let Some(prev_at) = self.prev_at.replace(now) {
+            let sample = now.saturating_duration_since(prev_at);
+            if sample.is_zero() || sample > MAX_POLL_GAP {
+                return;
+            }
+            // Exponential moving average, weight 0.3 for the new sample.
+            self.gap = Some(match self.gap {
+                Some(g) => g.mul_f32(0.7) + sample.mul_f32(0.3),
+                None => sample,
+            });
         }
     }
 
@@ -186,6 +232,7 @@ impl ChangeDetector {
     /// Feed a precomputed thumbnail captured at `now`.
     #[allow(clippy::needless_range_loop)] // parallel per-cell arrays
     pub fn observe_thumb(&mut self, thumb: Thumb, now: Instant) -> Change {
+        self.record_gap(now);
         let prev = self.prev.replace(thumb.clone());
         let (prev, reference) = match (prev, self.reference.as_ref()) {
             (Some(p), Some(r)) if p.same_shape(&thumb) && r.same_shape(&thumb) => (p, r),
@@ -205,6 +252,7 @@ impl ChangeDetector {
                 };
             }
         };
+        let (pause, dynamic_after) = self.effective_thresholds();
         let cfg = &self.cfg;
         let (w, h) = (thumb.width, thumb.height);
         let n = thumb.data.len();
@@ -214,7 +262,7 @@ impl ChangeDetector {
         for i in 0..n {
             if (thumb.data[i] - prev.data[i]).abs() > cfg.cell_threshold {
                 moved_count += 1;
-                if now.duration_since(self.last_move[i]) > cfg.pause {
+                if now.duration_since(self.last_move[i]) > pause {
                     self.moving_since[i] = now;
                 }
                 self.last_move[i] = now;
@@ -222,8 +270,8 @@ impl ChangeDetector {
         }
         let mut dynamic: Vec<bool> = (0..n)
             .map(|i| {
-                now.duration_since(self.moving_since[i]) > cfg.dynamic_after
-                    && now.duration_since(self.last_move[i]) < cfg.pause
+                now.duration_since(self.moving_since[i]) > dynamic_after
+                    && now.duration_since(self.last_move[i]) < pause
             })
             .collect();
         // Grow (4-neighbourhood) so a whole video rectangle is covered.
@@ -339,5 +387,64 @@ mod tests {
             }
         }
         assert!(d.observe(&big, t0 + Duration::from_millis(2050)).changed);
+    }
+
+    #[test]
+    fn slow_polling_still_finds_video() {
+        // Android screencap: one frame every 800 ms, longer than `pause`.
+        let mut d = ChangeDetector::new(SettleConfig::default());
+        let t0 = Instant::now();
+        let a = frame_with_box(320, 640, (64, 64, 64, 64), 250);
+        let b = frame_with_box(320, 640, (64, 64, 64, 64), 100);
+        d.observe(&a, t0);
+        let mut last = None;
+        for i in 1..=5u64 {
+            let f = if i % 2 == 0 { &a } else { &b };
+            last = Some(d.observe(f, t0 + Duration::from_millis(800 * i)));
+        }
+        let c = last.unwrap();
+        assert!(c.dynamic_fraction > 0.0, "video at 0.8 s polling: {c:?}");
+        assert!(!c.changed, "video must not count as a change: {c:?}");
+        let gap = d.frame_gap().unwrap();
+        assert!(gap.abs_diff(Duration::from_millis(800)) < Duration::from_millis(5));
+        let (pause, dynamic_after) = d.effective_thresholds();
+        assert!(
+            pause >= Duration::from_millis(1199) && dynamic_after >= Duration::from_millis(1599)
+        );
+    }
+
+    #[test]
+    fn idle_gaps_do_not_stretch_thresholds() {
+        let mut d = ChangeDetector::new(SettleConfig::default());
+        let t0 = Instant::now();
+        let a = frame_with_box(320, 640, (0, 0, 0, 0), 0);
+        d.observe(&a, t0);
+        d.observe(&a, t0 + Duration::from_millis(50));
+        // 10 s idle between two looks.
+        d.observe(&a, t0 + Duration::from_secs(10));
+        assert_eq!(d.frame_gap(), Some(Duration::from_millis(50)));
+        assert_eq!(
+            d.effective_thresholds(),
+            (
+                SettleConfig::default().pause,
+                SettleConfig::default().dynamic_after
+            )
+        );
+    }
+
+    #[test]
+    fn one_page_change_after_idle_is_not_dynamic() {
+        // A cell that moved in the last look and again after a long idle
+        // restarts its "moving since" timer: a single page change counts.
+        let mut d = ChangeDetector::new(SettleConfig::default());
+        let t0 = Instant::now();
+        let a = frame_with_box(320, 640, (0, 0, 320, 320), 250);
+        let b = frame_with_box(320, 640, (0, 0, 320, 320), 50);
+        d.observe(&a, t0);
+        for i in 1..=3u64 {
+            d.observe(&a, t0 + Duration::from_millis(800 * i));
+        }
+        let c = d.observe(&b, t0 + Duration::from_secs(8));
+        assert!(c.changed && c.big && c.dynamic_fraction == 0.0, "{c:?}");
     }
 }

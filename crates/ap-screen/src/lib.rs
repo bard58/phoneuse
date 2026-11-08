@@ -24,4 +24,6 @@ pub use detect::{Change, ChangeDetector, SettleConfig, Thumb};
 pub use llm::{LlmImage, LlmImageOptions, encode_for_llm, resize_max_side};
 pub use overlay::{GridOptions, MarkerStyle, draw_grid, draw_marker};
 pub use settle::{Settled, Settler, settle, settle_with};
-pub use strip::{DEFAULT_STRIP_OFFSETS, StripDedup, dedup_strip, frame_strip, strip_legend};
+pub use strip::{
+    DEFAULT_STRIP_OFFSETS, StripDedup, dedup_strip, frame_strip, frame_strip_timed, strip_legend,
+};

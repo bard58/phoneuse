@@ -5,10 +5,13 @@
 //! ~2.5 MB, text recognition ~9.5 MB), the same files its
 //! `download-models.sh` fetches.
 //!
-//! Checksums: when a [`ModelFile`] has a pinned `sha256`, the download must
-//! match it. Without one, the hash of the first download is recorded next to
-//! the file (`<name>.sha256`) and later loads are checked against it
-//! (trust on first use).
+//! Checksums: the default models have pinned SHA-256 hashes. A download must
+//! match the pinned hash, and [`crate::OcrsRecognizer::load`] checks the files
+//! against it before every load. A custom [`ModelFile`] without a pinned hash
+//! falls back to trust on first use: the hash of the first download is
+//! recorded next to the file (`<name>.sha256`) and later checks compare with
+//! it. That sidecar sits in the same writable folder, so it protects against
+//! corruption, not against a local attacker.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -22,6 +25,13 @@ use sha2::{Digest, Sha256};
 pub const DETECTION_MODEL: &str = "text-detection.onnx";
 /// File name of the text recognition model.
 pub const RECOGNITION_MODEL: &str = "text-recognition.onnx";
+
+/// Pinned SHA-256 of [`DETECTION_MODEL`] (2_499_479 bytes).
+pub const DETECTION_SHA256: &str =
+    "a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe";
+/// Pinned SHA-256 of [`RECOGNITION_MODEL`] (9_713_177 bytes).
+pub const RECOGNITION_SHA256: &str =
+    "86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5";
 
 const BASE_URL: &str = "https://ocrs-models.s3-accelerate.amazonaws.com";
 
@@ -39,21 +49,22 @@ pub struct ModelFile {
 
 /// The `ocrs` detection and recognition models.
 ///
-/// The upstream project publishes no checksums, so these are not pinned yet
-/// (`sha256: None`). Pin them with the hashes recorded in the `.sha256`
-/// files after a trusted download.
+/// The upstream project publishes no checksums. The pinned hashes come from
+/// a download on 2026-11-08, cross-checked against a second S3 endpoint
+/// (`ocrs-models.s3.amazonaws.com`). If upstream replaces a model, update
+/// the hash here.
 pub fn default_models() -> Vec<ModelFile> {
     vec![
         ModelFile {
             name: DETECTION_MODEL.into(),
             url: format!("{BASE_URL}/{DETECTION_MODEL}"),
-            sha256: None,
+            sha256: Some(DETECTION_SHA256.into()),
             approx_size: 2_500_000,
         },
         ModelFile {
             name: RECOGNITION_MODEL.into(),
             url: format!("{BASE_URL}/{RECOGNITION_MODEL}"),
-            sha256: None,
+            sha256: Some(RECOGNITION_SHA256.into()),
             approx_size: 9_700_000,
         },
     ]
@@ -129,6 +140,28 @@ pub fn verify_model(dir: &Path, model: &ModelFile) -> Result<String> {
     }
 }
 
+/// Check every model in `dir` before loading it. Any missing file, checksum
+/// mismatch or missing recorded checksum gives an [`Error::Setup`] that
+/// names the problem and tells the user to download the models again.
+pub fn check_models(dir: &Path, models: &[ModelFile]) -> Result<()> {
+    let hint = "run `agentphone setup ocr` to download the models again (about 12 MB)";
+    if let Some(m) = models.iter().find(|m| !dir.join(&m.name).is_file()) {
+        return Err(Error::setup(
+            format!("OCR model {} not found in {}", m.name, dir.display()),
+            hint,
+        ));
+    }
+    for m in models {
+        verify_model(dir, m).map_err(|e| {
+            Error::setup(
+                format!("OCR model {} failed verification: {e}", m.name),
+                hint,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// True when every model is present and verifies.
 pub fn models_ready(dir: &Path, models: &[ModelFile]) -> bool {
     models.iter().all(|m| verify_model(dir, m).is_ok())
@@ -146,8 +179,12 @@ pub async fn download_models(
     fs::create_dir_all(dir)?;
     // reqwest is built with `rustls-no-provider`; use ring (already in the tree).
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // No overall timeout (a slow link may need minutes for 12 MB), but a
+    // stalled connect or read fails instead of hanging.
     let client = reqwest::Client::builder()
         .user_agent(concat!("agentphone/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| Error::Other(format!("HTTP client: {e}")))?;
     let mut paths = Vec::with_capacity(models.len());
@@ -290,10 +327,49 @@ mod tests {
     }
 
     #[test]
+    fn check_models_rejects_missing_and_tampered() {
+        let d = tmpdir("check");
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let m = ModelFile {
+            name: "m.onnx".into(),
+            url: "https://example.invalid/m.onnx".into(),
+            sha256: Some(abc.into()),
+            approx_size: 3,
+        };
+        let e = check_models(&d, std::slice::from_ref(&m)).unwrap_err();
+        assert!(
+            e.hint().is_some() && e.to_string().contains("not found"),
+            "{e}"
+        );
+        fs::write(d.join("m.onnx"), b"tampered").unwrap();
+        let e = check_models(&d, std::slice::from_ref(&m)).unwrap_err();
+        assert!(
+            e.hint().is_some() && e.to_string().contains("checksum mismatch"),
+            "{e}"
+        );
+        fs::write(d.join("m.onnx"), b"abc").unwrap();
+        check_models(&d, &[m]).unwrap();
+        // The default models in an empty folder: a setup error, not a panic.
+        let e = check_models(&d, &default_models()).unwrap_err();
+        assert!(e.hint().unwrap().contains("agentphone setup ocr"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn defaults() {
         let m = default_models();
         assert_eq!(m.len(), 2);
         assert!(m[0].url.ends_with(DETECTION_MODEL));
+        assert!(m[1].url.ends_with(RECOGNITION_MODEL));
+        // Both default models are pinned (64 lowercase hex chars).
+        for f in &m {
+            let h = f.sha256.as_deref().expect("pinned");
+            assert_eq!(h.len(), 64);
+            assert!(
+                h.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+        }
         assert!(default_model_dir().unwrap().ends_with("ocrs"));
     }
 }

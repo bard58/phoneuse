@@ -9,8 +9,8 @@ use ap_core::{
     async_trait,
 };
 use ap_screen::{
-    DEFAULT_STRIP_OFFSETS, SettleConfig, Settler, StripDedup, dedup_strip, frame_strip, settle,
-    settle_with,
+    DEFAULT_STRIP_OFFSETS, SettleConfig, Settler, StripDedup, dedup_strip, frame_strip,
+    frame_strip_timed, settle, settle_with, strip_legend,
 };
 use image::{Rgba, RgbaImage};
 
@@ -21,6 +21,8 @@ struct Scripted {
     inner: MockDevice,
     t0: Instant,
     script: Arc<Script>,
+    /// Time each screenshot takes (a slow device).
+    delay: Duration,
 }
 
 impl Scripted {
@@ -29,7 +31,13 @@ impl Scripted {
             inner: MockDevice::new(),
             t0: Instant::now(),
             script: Arc::new(script),
+            delay: Duration::ZERO,
         }
+    }
+
+    fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 }
 
@@ -42,6 +50,9 @@ impl Device for Scripted {
         self.inner.capabilities()
     }
     async fn screenshot(&self) -> Result<Frame> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         Ok((self.script)(self.t0.elapsed()))
     }
     async fn tap(&self, at: Point) -> Result<()> {
@@ -181,4 +192,52 @@ async fn strip_takes_frames_at_offsets() {
 
     let no_shots = MockDevice::new().with_capabilities(Capabilities::NONE);
     assert!(frame_strip(&no_shots, &[Duration::ZERO]).await.is_err());
+}
+
+#[tokio::test]
+async fn timed_strip_reports_real_capture_times() {
+    // Each screenshot takes 500 ms, longer than the 0.3 s gaps in the offsets.
+    let d = Scripted::new(|_| page_at(0)).with_delay(Duration::from_millis(500));
+    let frames = frame_strip_timed(&d, &DEFAULT_STRIP_OFFSETS).await.unwrap();
+    let times: Vec<Duration> = frames.iter().map(|(_, t)| *t).collect();
+    assert_eq!(times.len(), 3);
+    // Midpoints: ~0.35 s, ~0.85 s, ~1.35 s, not 0.1 / 0.4 / 0.8 s.
+    assert!(times[0] >= Duration::from_millis(340), "{times:?}");
+    assert!(times[1] >= Duration::from_millis(840), "{times:?}");
+    assert!(times[2] >= Duration::from_millis(1340), "{times:?}");
+    assert!(times.windows(2).all(|w| w[0] < w[1]), "{times:?}");
+    assert_ne!(
+        strip_legend(&times),
+        strip_legend(&DEFAULT_STRIP_OFFSETS),
+        "the legend must use the real times"
+    );
+}
+
+#[tokio::test]
+async fn slow_polling_settles_on_video_across_looks() {
+    // Each screenshot takes 800 ms. A static page with a "video" box that
+    // changes on every frame: the detector must learn it is video.
+    let d = Scripted::new(|t| {
+        let mut f = page_at(600);
+        let v = if (t.as_millis() / 800) % 2 == 0 {
+            250
+        } else {
+            60
+        };
+        for y in 200..330 {
+            for x in 100..290 {
+                f.image.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        f
+    })
+    .with_delay(Duration::from_millis(800));
+    let mut s = Settler::default();
+    let first = s.settle(&d, None).await.unwrap();
+    let second = s.settle(&d, None).await.unwrap();
+    assert!(
+        second.ignored > 0.0 || first.ignored > 0.0,
+        "video never ignored: {first:?} {second:?}"
+    );
+    assert!(second.still, "{second:?}");
 }

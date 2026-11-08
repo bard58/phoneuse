@@ -21,7 +21,24 @@ pub const DEFAULT_STRIP_OFFSETS: [Duration; 3] = [
 /// Take one screenshot at each offset after now. If a screenshot takes longer
 /// than the gap to the next offset, the next one is taken at once. Failed
 /// screenshots are skipped (logged); it is an error only when all fail.
+///
+/// On a slow device the frames are taken later than `offsets` say. Use
+/// [`frame_strip_timed`] to label frames with their real times.
 pub async fn frame_strip(device: &dyn Device, offsets: &[Duration]) -> Result<Vec<Frame>> {
+    Ok(frame_strip_timed(device, offsets)
+        .await?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect())
+}
+
+/// Like [`frame_strip`], but each frame comes with the time it was taken,
+/// relative to the call (the midpoint of its screenshot request). Pass these
+/// times to [`strip_legend`] and to frame labels, not the nominal offsets.
+pub async fn frame_strip_timed(
+    device: &dyn Device,
+    offsets: &[Duration],
+) -> Result<Vec<(Frame, Duration)>> {
     let t0 = Instant::now();
     let mut frames = Vec::with_capacity(offsets.len());
     let mut last_err = None;
@@ -31,8 +48,11 @@ pub async fn frame_strip(device: &dyn Device, offsets: &[Duration]) -> Result<Ve
         if due > now {
             tokio::time::sleep(due - now).await;
         }
-        match device.screenshot().await {
-            Ok(f) => frames.push(f),
+        let started = t0.elapsed();
+        let shot = device.screenshot().await;
+        let taken = started + t0.elapsed().saturating_sub(started) / 2;
+        match shot {
+            Ok(f) => frames.push((f, taken)),
             Err(e) => {
                 tracing::warn!(error = %e, "strip screenshot failed");
                 last_err = Some(e);

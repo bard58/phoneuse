@@ -5,7 +5,8 @@
 //!   bar and glyph noise, sort in reading order), [`format_lines`]
 //!   (`"x y  text"` lines as in `mcp_server.py`), [`find_text`] (tap_on target).
 //! - With the cargo feature `ocr`: [`OcrsRecognizer`] (pure-Rust `ocrs` engine)
-//!   and [`models`] (download with progress and SHA-256 verification).
+//!   and [`models`] (download with progress, pinned SHA-256 hashes checked at
+//!   download and at load time).
 //!
 //! Without the `ocr` feature the crate still builds; [`default_recognizer`]
 //! returns [`Error::Unsupported`] with a hint.
