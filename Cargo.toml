@@ -1,6 +1,20 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# ap-hid is experimental: it stays a member (CI builds and tests it with
+# --workspace) but a plain `cargo build` / `cargo test` skips it.
+default-members = [
+    "crates/ap-agent",
+    "crates/ap-android",
+    "crates/ap-cli",
+    "crates/ap-core",
+    "crates/ap-ios",
+    "crates/ap-jev",
+    "crates/ap-llm",
+    "crates/ap-mcp",
+    "crates/ap-screen",
+    "crates/ap-vision",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +39,7 @@ ap-vision = { path = "crates/ap-vision", version = "0.1.0" }
 ap-llm = { path = "crates/ap-llm", version = "0.1.0" }
 ap-agent = { path = "crates/ap-agent", version = "0.1.0" }
 ap-mcp = { path = "crates/ap-mcp", version = "0.1.0" }
+ap-jev = { path = "crates/ap-jev", version = "0.1.0" }
 
 # External crates (versions verified 2026-11-08, see docs/ANALYSIS.md section 5)
 # idevice is pre-0.2: pin exactly. Use rustls with the `ring` provider (no OpenSSL, no aws-lc build).
@@ -38,9 +53,6 @@ idevice = { version = "=0.1.68", default-features = false, features = [
     "core_device_proxy",
     "tunnel_tcp_stack",
     "dvt",
-    "screenshotr",
-    "xctest",
-    "wda",
     "installation_proxy",
     "springboardservices",
     "mobile_image_mounter",
@@ -48,6 +60,7 @@ idevice = { version = "=0.1.68", default-features = false, features = [
     "tss",
     "heartbeat",
     "display_stream",
+    "remote_pairing",
 ] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "process", "signal"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "charset", "system-proxy"] }
@@ -69,6 +82,13 @@ futures = "0.3.34"
 adb_client = "3.2.3"
 serialport = "4.10.1"
 mdns-sd = "0.21.7"
+# TLS crypto provider for reqwest (rustls-no-provider): ring, installed by ap-llm.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# ap-ios: displayservice session ids (idevice takes uuid::Uuid).
+uuid = { version = "1.26.1", features = ["v4"] }
+# ap-mcp: streamable HTTP transport (serves rmcp's tower service on 127.0.0.1).
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -80,3 +100,37 @@ all = { level = "warn", priority = -1 }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# OCR is very slow without optimization: build it optimized in dev and test too.
+[profile.dev.package.ocrs]
+opt-level = 3
+
+[profile.dev.package.rten]
+opt-level = 3
+
+[profile.dev.package.rten-base]
+opt-level = 3
+
+[profile.dev.package.rten-gemm]
+opt-level = 3
+
+[profile.dev.package.rten-imageproc]
+opt-level = 3
+
+[profile.dev.package.rten-onnx]
+opt-level = 3
+
+[profile.dev.package.rten-parallel]
+opt-level = 3
+
+[profile.dev.package.rten-shape-inference]
+opt-level = 3
+
+[profile.dev.package.rten-simd]
+opt-level = 3
+
+[profile.dev.package.rten-tensor]
+opt-level = 3
+
+[profile.dev.package.rten-vecmath]
+opt-level = 3
