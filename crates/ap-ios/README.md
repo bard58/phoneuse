@@ -82,5 +82,5 @@ The DDI cache is `<cache dir>/ddi/Xcode_iOS_DDI_Personalized/`. Set `AGENTPHONE_
 - R7: The displayservice offer imitates a Mac (`Mac17,7`, `25F71`). A later iOS can refuse it.
 - R8: Typing uses a US layout. Another hardware-keyboard layout on the iPhone can change the symbols. The pasteboard fallback is unverified.
 - R9: agentphone cannot turn on Developer Mode when a passcode is set. The user must use Settings.
-- R10: The iPhone 17 family identifiers (`iPhone18,x`) in the model table come from public lists. They are not verified.
+- R10: The iPhone 17 and iPhone 18 family identifiers (`iPhone18,x`, `iPhone19,x`) in the model table come from public lists. They are not verified. A model that is not in the table gets its screen size from the first screenshot at connect time (log line `unknown iPhone model ...`). If that screenshot fails, the iPhone 13 size is the default.
 - R11: Wi-Fi: CoreDeviceProxy over the lockdown TCP path needs `EnableWifiConnections`. `save_wifi_pairing` sets it. The RemotePairing path and the mDNS matching are unverified.

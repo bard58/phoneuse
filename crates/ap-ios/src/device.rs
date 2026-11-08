@@ -86,6 +86,48 @@ async fn open_backend(kind: BackendKind, r: &Resolved) -> Result<Box<dyn IosBack
     }
 }
 
+/// Time limit for the screenshot that measures an unknown model's screen.
+const MEASURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Set the screen size of a model that is not in the model table from one
+/// screenshot. If the screenshot fails, keep the default size and log a
+/// warning. This never stops the connection: touch input uses normalized
+/// coordinates and does not need the size.
+async fn measure_unknown_screen(b: &mut dyn IosBackend, info: &mut DeviceInfo) {
+    let shot = tokio::time::timeout(MEASURE_TIMEOUT, b.screenshot()).await;
+    let measured = match shot {
+        Ok(Ok(f)) => crate::models::sizes_from_screenshot(f.size()),
+        Ok(Err(e)) => {
+            tracing::warn!("screenshot for screen size failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("screenshot for screen size timed out");
+            None
+        }
+    };
+    match measured {
+        Some((points, pixels)) => {
+            tracing::info!(
+                "unknown iPhone model {:?}: screen size {}x{} pt, {}x{} px, from a screenshot",
+                info.model,
+                points.width,
+                points.height,
+                pixels.width,
+                pixels.height
+            );
+            info.screen_points = points;
+            info.screen_pixels = pixels;
+        }
+        None => tracing::warn!(
+            "unknown iPhone model {:?}: screen size not measured, using the default {}x{} pt",
+            info.model,
+            info.screen_points.width,
+            info.screen_points.height
+        ),
+    }
+}
+
 fn source_name(s: &TunnelSource) -> &'static str {
     match s {
         TunnelSource::Lockdown(_) => "CoreDeviceProxy",
@@ -108,9 +150,12 @@ impl IosDevice {
             let mut last = None;
             for kind in kinds {
                 match Box::pin(open_backend(kind, &r)).await {
-                    Ok(b) => {
+                    Ok(mut b) => {
                         let mut info = r.info.clone();
                         info.backend = b.name().to_string();
+                        if crate::models::lookup(&info.model).is_none() {
+                            Box::pin(measure_unknown_screen(&mut *b, &mut info)).await;
+                        }
                         let caps = b.capabilities();
                         return Ok((b, (info, caps, r.version)));
                     }
@@ -382,6 +427,18 @@ mod tests {
     }
 
     const APP: &str = "com.apple.Preferences";
+
+    /// An unknown model keeps the default size when the screenshot is not
+    /// usable (Null gives 2x2 px), and the connection does not fail.
+    #[tokio::test]
+    async fn unknown_model_keeps_default_size_without_usable_screenshot() {
+        let mut info = null_device().await.info.clone();
+        info.model = "iPhone99,1".into();
+        let mut b = Null;
+        measure_unknown_screen(&mut b, &mut info).await;
+        assert_eq!(info.screen_points, crate::models::FALLBACK_POINTS);
+        assert_eq!(info.screen_pixels, crate::models::FALLBACK_PIXELS);
+    }
 
     /// Every input makes the foreground app unknown, so the Jev guard
     /// (block_unknown_app) does not trust a stale bundle id.

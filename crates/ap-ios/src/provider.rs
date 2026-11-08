@@ -64,7 +64,13 @@ impl Default for IosProvider {
 
 /// Build a [`DeviceInfo`] from lockdown values.
 pub(crate) fn device_info(udid: &str, li: &LockdownInfo, backend: &str) -> DeviceInfo {
-    let (points, pixels, _) = models::screen_sizes(&li.product_type);
+    let (points, pixels, known) = models::screen_sizes(&li.product_type);
+    if !known && !li.product_type.is_empty() {
+        tracing::debug!(
+            "unknown iPhone model {:?}: default screen size until a screenshot",
+            li.product_type
+        );
+    }
     DeviceInfo {
         id: udid.to_string(),
         name: if li.name.is_empty() {
