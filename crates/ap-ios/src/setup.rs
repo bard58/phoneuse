@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connect::{self, LockdownInfo};
 use crate::errors::{DDI_HINT, DEVMODE_HINT, PAIR_HINT, ctx};
+use crate::mdns;
 use crate::models;
 use crate::provider::pick_udid;
 use crate::store::{self, DeviceRecord};
@@ -593,6 +594,10 @@ fn ddi_complete(dir: &Path) -> bool {
     })
 }
 
+/// Hint for a failed DDI download.
+const DOWNLOAD_HINT: &str =
+    "check the Internet connection, or set AGENTPHONE_DDI_MIRROR to another mirror";
+
 fn mirror_url() -> String {
     std::env::var("AGENTPHONE_DDI_MIRROR")
         .ok()
@@ -602,8 +607,12 @@ fn mirror_url() -> String {
 
 async fn download_into(dir: &Path, base: &str, progress: &ProgressFn) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // No overall timeout: it would cut a large download on a slow link. The
+    // read timeout is an idle timer per read, so a stalled body stops.
     let client = reqwest::Client::builder()
         .user_agent(concat!("agentphone/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| Error::Other(format!("HTTP client: {e}")))?;
     tokio::fs::create_dir_all(dir).await?;
@@ -621,19 +630,15 @@ async fn download_into(dir: &Path, base: &str, progress: &ProgressFn) -> Result<
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .map_err(|e| {
-                Error::setup(
-                    format!("cannot download {url}: {e}"),
-                    "check the Internet connection, or set AGENTPHONE_DDI_MIRROR to another mirror",
-                )
-            })?;
+            .map_err(|e| Error::setup(format!("cannot download {url}: {e}"), DOWNLOAD_HINT))?;
         let total = resp.content_length();
         let part = dir.join(format!("{f}.part"));
         let mut file = tokio::fs::File::create(&part).await?;
         let mut done = 0u64;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Error::NotConnected(format!("download {f}: {e}")))?;
+            let chunk =
+                chunk.map_err(|e| Error::setup(format!("download {f}: {e}"), DOWNLOAD_HINT))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
             done += chunk.len() as u64;
             progress(Progress::Download {
@@ -767,6 +772,20 @@ pub struct WifiPairing {
     pub remote_pairing_error: Option<String>,
 }
 
+/// The Wi-Fi IP of the iPhone with this Wi-Fi MAC, from `_apple-mobdev2._tcp`.
+async fn wifi_ip(wifi_mac: &str) -> Option<std::net::IpAddr> {
+    let mac = mdns::normalize_mac(wifi_mac);
+    if mac.is_empty() {
+        return None;
+    }
+    let found = mdns::browse(&[mdns::MOBDEV2], Duration::from_millis(1500)).await;
+    found
+        .iter()
+        .find(|f| f.mobdev2_mac().as_deref() == Some(mac.as_str()))
+        .and_then(mdns::Found::best_addr)
+        .map(|(ip, _)| ip)
+}
+
 /// Save the pairing for Wi-Fi use (needs the USB cable once):
 /// 1. the lockdown pairing record from usbmuxd, with Wi-Fi connections
 ///    turned on (`EnableWifiConnections`);
@@ -826,16 +845,19 @@ pub async fn save_wifi_pairing(cfg: &IosConfig, id: Option<&str>) -> Result<Wifi
         }
         .await;
 
+        // `dev` is a USB entry, so the IP comes from mDNS (the iPhone
+        // advertises lockdown over Wi-Fi), else from the old record.
+        let last_ip = match wifi_ip(&wifi_mac).await {
+            Some(ip) => Some(ip),
+            None => store::load_record(&dir, &dev.udid).and_then(|r| r.last_ip),
+        };
         let rec = DeviceRecord {
             udid: dev.udid.clone(),
             name: li.name.clone(),
             product_type: li.product_type.clone(),
             os_version: li.product_version.clone(),
             wifi_mac,
-            last_ip: match dev.connection_type {
-                Connection::Network(ip) => Some(ip),
-                _ => store::load_record(&dir, &dev.udid).and_then(|r| r.last_ip),
-            },
+            last_ip,
         };
         store::save_record(&dir, &rec)?;
         Ok(WifiPairing {

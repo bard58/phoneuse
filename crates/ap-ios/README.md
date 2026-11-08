@@ -42,7 +42,11 @@ Run `setup::check` on the real device. If the `hid_services` check fails after t
 
 - Each `IosDevice` has its own OS thread. The thread has a 32 MiB stack and a current-thread tokio runtime. The backend lives on that thread. The `Device` methods send jobs to it through a channel. Thus the caller does not need a big stack, and the idevice futures do not need to be `Send`.
 - `setup` and `discover` also run on a temporary big-stack thread.
-- `HidBackend` keeps one tunnel and one displayservice media stream (the HID auth gate) per session. Two background tasks read and drop the RTP datagrams, so memory does not grow. A transport error closes the session. The call then opens a new session and runs once more.
+- `HidBackend` keeps one tunnel and one displayservice media stream (the HID auth gate) per session. Two background tasks read and drop the RTP datagrams, so memory does not grow. A transport error closes the session, and the next call opens a new one. Input is not replayed: an input call runs once more only when the error came before its first event. After that, it returns an "input may be partly delivered" error, which is not a transport error. Screenshot, pasteboard and launch get one full retry.
+- On an error or a cancel in the middle of a gesture or a key stroke, the backend sends the touch release or key up as best effort.
+- Time limits: each attempt has a budget (setup + expected work + slack). The worker thread also stops a job at a backstop deadline and drops the session. Thus one stalled read does not block the device for good. An expired limit is `Error::Timeout`.
+- Cancel: `IosDevice::cancel_handle()` gives a `CancelHandle` (`Send + Sync`). `cancel()` stops the calls submitted before it: a queued call does not start, and a running text, drag, long press, pinch or button sequence stops at the next stroke or point. The call returns the error from `ap_ios::cancelled()` (test it with `ap_ios::is_cancelled`).
+- `foreground_app` fails closed: it returns the app of the last `launch_app` only until the next input (tap, swipe, scroll, text, key, button, pinch). iOS has no foreground-app query on this route, and any input can open another app.
 - Touch uses `UniversalHidServiceClient` with normalized `u16` coordinates (0 to 65535). Keys and buttons use `IndigoHidClient`.
 - `type_text` sends US-layout key strokes. If the text has a character without a US key (accents, non-Latin scripts, emoji), it puts the whole text on the pasteboard and sends Cmd+V.
 - The App Switcher is a double Home press.
@@ -63,7 +67,7 @@ fn main() -> std::process::ExitCode {
 
 ## Files
 
-The pairing folder is `ios.pairing_dir`, or `%APPDATA%\agentphone\data\ios-pairing` on Windows. It holds `<udid>.plist` (lockdown pairing), `<udid>.rppairing` (RemotePairing), and `<udid>.json` (name, model, last IP). These files are secrets: they give control of the iPhone.
+The pairing folder is `ios.pairing_dir`, or `%APPDATA%\agentphone\data\ios-pairing` on Windows. It holds `<udid>.plist` (lockdown pairing), `<udid>.rppairing` (RemotePairing), and `<udid>.json` (name, model, last IP). These files are secrets: they give control of the iPhone. On Unix the folder is mode 700 and the files are mode 600 from creation. On Windows the files get the ACL of the folder. The default folder is private to the user. A custom `pairing_dir` must be a folder that only the user can read.
 
 The DDI cache is `<cache dir>/ddi/Xcode_iOS_DDI_Personalized/`. Set `AGENTPHONE_DDI_MIRROR` to use another mirror.
 

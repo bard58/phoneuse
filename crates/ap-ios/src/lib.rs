@@ -9,7 +9,8 @@
 //!   devices over usbmuxd (Windows: Apple Mobile Device Service on
 //!   127.0.0.1:27015) and saved Wi-Fi pairings (mDNS `_apple-mobdev2._tcp`,
 //!   `_remotepairing._tcp`).
-//! - [`IosDevice`]: a [`Device`](ap_core::Device).
+//! - [`IosDevice`]: a [`Device`](ap_core::Device). [`CancelHandle`] (from
+//!   [`IosDevice::cancel_handle`]) stops its in-flight calls.
 //! - [`setup`]: checks and fix actions for `agentphone doctor`.
 //! - [`runtime_builder`], [`block_on`]: big-stack runtime helpers (Windows).
 //! - [`models`]: iPhone model table. [`keymap`], [`coords`]: input mapping.
@@ -18,6 +19,7 @@
 //! Every device path is UNVERIFIED. See `README.md`.
 
 pub mod backend;
+mod cancel;
 mod connect;
 pub mod coords;
 mod device;
@@ -35,6 +37,7 @@ pub mod version;
 mod worker;
 
 pub use ap_core;
+pub use cancel::{CANCELLED_PREFIX, CancelCheck, CancelHandle, cancelled, is_cancelled};
 pub use connect::usbmuxd_hint;
 pub use device::{IosDevice, SCROLL_DURATION};
 pub use provider::IosProvider;

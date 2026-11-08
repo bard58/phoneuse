@@ -9,6 +9,10 @@
 //! * `<udid>.json`: [`DeviceRecord`] (name, model, last IP).
 //!
 //! These files are secrets: anyone with them can control the paired iPhone.
+//! On Unix the folder is mode 700 and the files are mode 600 from creation.
+//! On Windows the files get the ACL of the folder: the default folder (under
+//! `%APPDATA%`) is private to the user. A custom `pairing_dir` must be a
+//! folder that only the user can read.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -97,26 +101,72 @@ pub fn load_record(dir: &Path, udid: &str) -> Option<DeviceRecord> {
     serde_json::from_slice(&std::fs::read(p.record).ok()?).ok()
 }
 
+/// Save a record. It holds the Wi-Fi MAC and IP, so it is written like a
+/// secret (see [`write_secret`]).
 pub fn save_record(dir: &Path, rec: &DeviceRecord) -> Result<()> {
     let p = paths(dir, &rec.udid)?;
-    std::fs::create_dir_all(dir)?;
     let json = serde_json::to_vec_pretty(rec).map_err(|e| Error::Other(e.to_string()))?;
-    std::fs::write(p.record, json)?;
+    write_secret(&p.record, &json)
+}
+
+/// Create the pairing folder. Unix: mode 700, also when it exists already.
+fn private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
     Ok(())
 }
 
-/// Write a secret file. Best effort to keep it private (Unix mode 600).
-pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
+fn write_new(tmp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(())
+    let mut f = opts.open(tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(tmp, path)
+}
+
+/// Write a secret file atomically: a new temp file in the same folder
+/// (Unix: mode 600 from creation), then a rename onto `path`. Every error is
+/// returned.
+pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    private_dir(parent)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::InvalidArgument(format!("bad secret path {}", path.display())))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = parent.join(tmp_name);
+    // A temp file left by a crash: remove it, so create_new can succeed.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let r = write_new(&tmp, path, bytes);
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -139,6 +189,27 @@ mod tests {
         assert_eq!(list_records(&dir), vec![rec]);
         assert!(paths(&dir, "../evil").is_err());
         assert!(list_records(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn secrets_replace_and_stay_private() {
+        let dir = std::env::temp_dir().join(format!("ap-ios-secret-{}", std::process::id()));
+        let sub = dir.join("sub");
+        let f = sub.join("dev.plist");
+        write_secret(&f, b"one").unwrap();
+        // A stale temp file from a crash does not block the next write.
+        std::fs::write(sub.join("dev.plist.tmp"), b"junk").unwrap();
+        write_secret(&f, b"two").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"two");
+        assert!(!sub.join("dev.plist.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&f), 0o600);
+            assert_eq!(mode(&sub), 0o700);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

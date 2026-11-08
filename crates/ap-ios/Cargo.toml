@@ -10,7 +10,8 @@ repository.workspace = true
 
 [dependencies]
 ap-core.workspace = true
-idevice.workspace = true
+# `mdns`: auth-tag matching of `_apple-mobdev2._tcp` (iOS 26.4+).
+idevice = { workspace = true, features = ["mdns"] }
 tokio.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

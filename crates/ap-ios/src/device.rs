@@ -9,8 +9,11 @@ use ap_core::{
 };
 
 use crate::backend::IosBackend;
+use crate::cancel::CancelHandle;
 use crate::coords::scroll_points;
-use crate::hid::{HidBackend, TunnelSource};
+use crate::hid::{
+    HidBackend, TunnelSource, WORK_DVT, WORK_SHORT, job_deadline, work_gesture, work_text,
+};
 use crate::provider::{Resolved, resolve};
 use crate::version::{BackendKind, IosVersion, select_backends};
 use crate::worker::Worker;
@@ -24,13 +27,17 @@ pub struct IosDevice {
     caps: Capabilities,
     version: IosVersion,
     worker: Worker,
-    /// The app opened by the last `launch_app`. Cleared by anything that can
-    /// leave the app (Home, App Switcher, Lock, a swipe from the bottom edge,
-    /// a Cmd shortcut). iOS gives no foreground-app query over this route.
+    /// The app opened by the last `launch_app`, until the next input.
+    /// iOS gives no foreground-app query over this route.
     last_app: AppTracker,
 }
 
 /// Tracks the app opened by `launch_app` (see [`IosDevice::foreground_app`]).
+///
+/// Fail closed: every input (tap, swipe, scroll, text, key, button, pinch)
+/// forgets the app, because any of them can open another app (a link, a
+/// notification, a share sheet, an edge swipe, Enter on a link). So the app
+/// is known only between a successful `launch_app` and the next input.
 #[derive(Debug, Default)]
 pub struct AppTracker(std::sync::Mutex<Option<String>>);
 
@@ -45,25 +52,9 @@ impl AppTracker {
         }
     }
 
-    /// Forget the app when a button can leave it.
-    pub fn on_button(&self, b: Button) {
-        if matches!(b, Button::Home | Button::AppSwitcher | Button::Lock) {
-            self.set(None);
-        }
-    }
-
-    /// Forget the app on a swipe from the bottom edge (go home, switch apps).
-    pub fn on_swipe(&self, from: Point) {
-        if from.y >= 0.95 {
-            self.set(None);
-        }
-    }
-
-    /// Forget the app on a Cmd shortcut (Cmd+H, Cmd+Space, Cmd+Tab).
-    pub fn on_key(&self, k: &Key) {
-        if k.parts().0.meta {
-            self.set(None);
-        }
+    /// Forget the app before an input.
+    pub fn on_input(&self) {
+        self.set(None);
     }
 }
 
@@ -146,12 +137,29 @@ impl IosDevice {
         self.version
     }
 
+    /// A `Send + Sync` handle that cancels this device's in-flight calls
+    /// (see [`CancelHandle`]). Keep it next to the `Box<dyn Device>` and call
+    /// [`CancelHandle::cancel`] from another task (for example on Ctrl+C).
+    /// The stopped call returns [`crate::cancelled`].
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.worker.cancel_handle()
+    }
+
+    /// Cancel every call submitted before now. Same as
+    /// `self.cancel_handle().cancel()`.
+    pub fn cancel(&self) {
+        self.worker.cancel_handle().cancel();
+    }
+
     /// Two-finger pinch around `center`. `from`/`to` are the finger
     /// distances (normalized). `from < to` zooms in.
     pub async fn pinch(&self, center: Point, from: f32, to: f32, duration: Duration) -> Result<()> {
         let center = check_point(center)?;
+        self.last_app.on_input();
         self.worker
-            .call(move |b| b.pinch(center, from, to, duration))
+            .call_within(job_deadline(work_gesture(duration)), move |b| {
+                b.pinch(center, from, to, duration)
+            })
             .await
     }
 }
@@ -162,40 +170,65 @@ impl Device for IosDevice {
         &self.info
     }
 
+    /// Stop every call sent before now (see [`IosDevice::cancel_handle`]).
+    fn cancel(&self) {
+        self.worker.cancel_handle().cancel();
+    }
+
     fn capabilities(&self) -> Capabilities {
         self.caps
     }
 
     async fn screenshot(&self) -> Result<Frame> {
-        self.worker.call(|b| b.screenshot()).await
+        self.worker
+            .call_within(job_deadline(WORK_DVT), |b| b.screenshot())
+            .await
     }
 
     async fn tap(&self, at: Point) -> Result<()> {
         let at = check_point(at)?;
-        self.worker.call(move |b| b.tap(at)).await
+        self.last_app.on_input();
+        self.worker
+            .call_within(job_deadline(WORK_SHORT), move |b| b.tap(at))
+            .await
     }
 
     async fn double_tap(&self, at: Point) -> Result<()> {
         let at = check_point(at)?;
-        self.worker.call(move |b| b.double_tap(at)).await
+        self.last_app.on_input();
+        self.worker
+            .call_within(job_deadline(WORK_SHORT), move |b| b.double_tap(at))
+            .await
     }
 
     async fn long_press(&self, at: Point, duration: Duration) -> Result<()> {
         let at = check_point(at)?;
-        self.worker.call(move |b| b.long_press(at, duration)).await
+        self.last_app.on_input();
+        self.worker
+            .call_within(job_deadline(work_gesture(duration)), move |b| {
+                b.long_press(at, duration)
+            })
+            .await
     }
 
     async fn swipe(&self, from: Point, to: Point, duration: Duration) -> Result<()> {
         let (from, to) = (check_point(from)?, check_point(to)?);
-        self.last_app.on_swipe(from);
-        self.worker.call(move |b| b.swipe(from, to, duration)).await
+        self.last_app.on_input();
+        self.worker
+            .call_within(job_deadline(work_gesture(duration)), move |b| {
+                b.swipe(from, to, duration)
+            })
+            .await
     }
 
     async fn scroll(&self, at: Point, direction: SwipeDirection, amount: f32) -> Result<()> {
         let at = check_point(at)?;
         let (from, to) = scroll_points(at, direction, amount);
+        self.last_app.on_input();
         self.worker
-            .call(move |b| b.swipe(from, to, SCROLL_DURATION))
+            .call_within(job_deadline(work_gesture(SCROLL_DURATION)), move |b| {
+                b.swipe(from, to, SCROLL_DURATION)
+            })
             .await
     }
 
@@ -203,23 +236,35 @@ impl Device for IosDevice {
         if text.is_empty() {
             return Ok(());
         }
+        self.last_app.on_input();
+        let deadline = job_deadline(work_text(text.chars().count()));
         let text = text.to_string();
         self.worker
-            .call(move |b| Box::pin(async move { b.type_text(&text).await }))
+            .call_within(deadline, move |b| {
+                Box::pin(async move { b.type_text(&text).await })
+            })
             .await
     }
 
     async fn key(&self, key: &Key) -> Result<()> {
-        self.last_app.on_key(key);
+        self.last_app.on_input();
         let key = key.clone();
         self.worker
-            .call(move |b| Box::pin(async move { b.key(&key).await }))
+            .call_within(job_deadline(WORK_SHORT), move |b| {
+                Box::pin(async move { b.key(&key).await })
+            })
             .await
     }
 
     async fn button(&self, button: Button) -> Result<()> {
-        self.last_app.on_button(button);
-        self.worker.call(move |b| b.button(button)).await
+        self.last_app.on_input();
+        // The longest press (Siri) holds 1.2 s. 5 s covers every sequence.
+        self.worker
+            .call_within(
+                job_deadline(work_gesture(Duration::from_secs(5))),
+                move |b| b.button(button),
+            )
+            .await
     }
 
     async fn launch_app(&self, bundle_id: &str) -> Result<()> {
@@ -227,23 +272,31 @@ impl Device for IosDevice {
         // Unknown while the launch runs; known only after it succeeds.
         self.last_app.set(None);
         self.worker
-            .call(move |b| Box::pin(async move { b.launch_app(&id).await }))
+            .call_within(job_deadline(WORK_DVT), move |b| {
+                Box::pin(async move { b.launch_app(&id).await })
+            })
             .await?;
         self.last_app.set(Some(bundle_id.to_string()));
         Ok(())
     }
 
     async fn list_apps(&self) -> Result<Vec<String>> {
-        self.worker.call(|b| b.list_apps()).await
+        self.worker
+            .call_within(job_deadline(WORK_DVT), |b| b.list_apps())
+            .await
     }
 
     async fn ui_tree(&self) -> Result<Option<String>> {
-        self.worker.call(|b| b.ui_tree()).await
+        self.worker
+            .call_within(job_deadline(WORK_DVT), |b| b.ui_tree())
+            .await
     }
 
-    /// The app opened by the last `launch_app`, or `None` (unknown) after
-    /// anything that can leave it. A tap that opens another app (a link, a
-    /// share sheet) is not detected.
+    /// The app opened by the last `launch_app`, until the next input. After
+    /// any tap, swipe, scroll, text, key, button or pinch it is `None`
+    /// (unknown), because iOS gives no foreground-app query over this route
+    /// and any input can open another app. So on iPhone the app is known only
+    /// on the first look after `launch_app`.
     async fn foreground_app(&self) -> Result<Option<String>> {
         Ok(self.last_app.get())
     }
@@ -252,28 +305,121 @@ impl Device for IosDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_core::Modifiers;
 
     #[test]
-    fn app_tracker_forgets_on_leave() {
+    fn app_tracker_forgets_on_input() {
         let t = AppTracker::default();
         assert_eq!(t.get(), None);
         t.set(Some("com.apple.Preferences".into()));
-        t.on_button(Button::VolumeUp);
-        t.on_swipe(Point::new(0.5, 0.5));
-        t.on_key(&Key::Enter);
         assert_eq!(t.get().as_deref(), Some("com.apple.Preferences"));
-        t.on_swipe(Point::new(0.5, 0.99));
+        t.on_input();
         assert_eq!(t.get(), None);
-        t.set(Some("a.b".into()));
-        t.on_button(Button::Home);
-        assert_eq!(t.get(), None);
-        t.set(Some("a.b".into()));
-        let cmd = Modifiers {
-            meta: true,
-            ..Modifiers::NONE
-        };
-        t.on_key(&Key::Char('h').with(cmd));
-        assert_eq!(t.get(), None);
+    }
+
+    /// Accepts every call.
+    struct Null;
+
+    #[async_trait::async_trait(?Send)]
+    impl IosBackend for Null {
+        fn name(&self) -> &'static str {
+            "null"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::NONE
+        }
+        async fn screenshot(&mut self) -> Result<Frame> {
+            Ok(Frame::solid(2, 2, [0, 0, 0, 255]))
+        }
+        async fn tap(&mut self, _: Point) -> Result<()> {
+            Ok(())
+        }
+        async fn double_tap(&mut self, _: Point) -> Result<()> {
+            Ok(())
+        }
+        async fn long_press(&mut self, _: Point, _: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn swipe(&mut self, _: Point, _: Point, _: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn type_text(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn key(&mut self, _: &Key) -> Result<()> {
+            Ok(())
+        }
+        async fn button(&mut self, _: Button) -> Result<()> {
+            Ok(())
+        }
+        async fn launch_app(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn null_device() -> IosDevice {
+        let (worker, ()) = Worker::start("ap-ios-null".into(), || async {
+            let b: Box<dyn IosBackend> = Box::new(Null);
+            Ok((b, ()))
+        })
+        .await
+        .unwrap();
+        IosDevice {
+            info: DeviceInfo {
+                id: "null".into(),
+                name: "null".into(),
+                platform: ap_core::Platform::Ios,
+                os_version: "26.0".into(),
+                model: "iPhone14,5".into(),
+                screen_points: ap_core::Size::new(390.0, 844.0),
+                screen_pixels: ap_core::Size::new(1170.0, 2532.0),
+                backend: "null".into(),
+            },
+            caps: Capabilities::NONE,
+            version: IosVersion::parse("26.0").unwrap(),
+            worker,
+            last_app: AppTracker::default(),
+        }
+    }
+
+    const APP: &str = "com.apple.Preferences";
+
+    /// Every input makes the foreground app unknown, so the Jev guard
+    /// (block_unknown_app) does not trust a stale bundle id.
+    #[tokio::test]
+    async fn foreground_app_is_unknown_after_any_input() {
+        let d = null_device().await;
+        let p = Point::new(0.5, 0.8);
+        let ms = Duration::from_millis(10);
+        for step in 0..9 {
+            d.launch_app(APP).await.unwrap();
+            assert_eq!(d.foreground_app().await.unwrap().as_deref(), Some(APP));
+            // Observation does not forget the app.
+            d.screenshot().await.unwrap();
+            assert_eq!(d.foreground_app().await.unwrap().as_deref(), Some(APP));
+            match step {
+                0 => d.tap(p).await.unwrap(),
+                1 => d.double_tap(p).await.unwrap(),
+                2 => d.long_press(p, ms).await.unwrap(),
+                3 => d.swipe(Point::new(0.5, 0.0), p, ms).await.unwrap(),
+                // Starts at the bottom edge: the go-home gesture.
+                4 => d.scroll(p, SwipeDirection::Up, 0.5).await.unwrap(),
+                5 => d.type_text("hi").await.unwrap(),
+                6 => d.key(&Key::Enter).await.unwrap(),
+                7 => d.button(Button::VolumeUp).await.unwrap(),
+                _ => {
+                    let _ = d.pinch(Point::CENTER, 0.1, 0.3, ms).await;
+                }
+            }
+            assert_eq!(d.foreground_app().await.unwrap(), None, "step {step}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_handle_does_not_block_later_calls() {
+        let d = null_device().await;
+        let h = d.cancel_handle();
+        h.cancel();
+        d.cancel();
+        d.tap(Point::CENTER).await.unwrap();
     }
 }

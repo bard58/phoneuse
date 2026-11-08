@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use ap_core::{Error, Result};
 use idevice::{
@@ -29,6 +30,19 @@ pub const SVC_INDIGO: &str = "com.apple.coredevice.hid.indigo";
 pub const SVC_UHID: &str = "com.apple.coredevice.hid.universalhidservice";
 
 pub const REQUIRED_SERVICES: &[&str] = &[SVC_DVT, SVC_DISPLAY, SVC_INDIGO, SVC_UHID];
+
+/// Time limit for one TCP connect to the iPhone.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time limit for the RemotePairing pair-verify step.
+const PAIR_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn tcp_connect(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+    match tokio::time::timeout(TCP_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(Error::NotConnected(format!("connect {addr}: {e}"))),
+        Err(_) => Err(Error::Timeout(TCP_CONNECT_TIMEOUT)),
+    }
+}
 
 /// A live tunnel with its RSD service list.
 pub struct Tunnel {
@@ -93,29 +107,35 @@ pub async fn open_remote_pairing(
     let mut rpf = RpPairingFile::read_from_file(pairing_path)
         .await
         .map_err(ctx("read RemotePairing file"))?;
-    let tcp = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(|e| Error::NotConnected(format!("connect {addr}: {e}")))?;
+    let tcp = tcp_connect(addr).await?;
     let mut rpc = RemotePairingClient::new(RpPairingSocket::new(tcp), host_name);
-    // A PIN request means the saved file is no longer valid. Return an empty
-    // PIN so the pairing fails instead of waiting for input.
-    Box::pin(rpc.connect(&mut rpf, async || String::new()))
-        .await
-        .map_err(|e| {
-            Error::setup(
-                format!("Wi-Fi pairing was refused ({e})"),
-                "connect the iPhone with a cable and save the Wi-Fi pairing again (`agentphone doctor`)",
-            )
-        })?;
+    // Verify the saved pairing only. idevice's `connect()` falls back to an
+    // interactive pair (a Trust prompt on the iPhone, fixed PIN, no time
+    // limit) when the verify fails, and the new keys would not be saved. A
+    // failed verify is a setup error instead.
+    let refused = |e: idevice::IdeviceError| {
+        Error::setup(
+            format!("Wi-Fi pairing was refused ({e})"),
+            "connect the iPhone with a cable and save the Wi-Fi pairing again (`agentphone doctor`)",
+        )
+    };
+    let verify = async {
+        rpc.attempt_pair_verify().await.map_err(refused)?;
+        Box::pin(rpc.validate_pairing(&mut rpf))
+            .await
+            .map_err(refused)
+    };
+    match tokio::time::timeout(PAIR_VERIFY_TIMEOUT, verify).await {
+        Ok(r) => r?,
+        Err(_) => return Err(Error::Timeout(PAIR_VERIFY_TIMEOUT)),
+    }
     let port = rpc
         .create_tcp_listener()
         .await
         .map_err(ctx("RemotePairing createListener"))?;
     let mut tunnel_addr = addr;
     tunnel_addr.set_port(port);
-    let tcp = tokio::net::TcpStream::connect(tunnel_addr)
-        .await
-        .map_err(|e| Error::NotConnected(format!("connect {tunnel_addr}: {e}")))?;
+    let tcp = tcp_connect(tunnel_addr).await?;
     let tunnel = Box::pin(connect_tls_psk_tunnel_native(tcp, rpc.encryption_key()))
         .await
         .map_err(ctx("TLS-PSK tunnel"))?;

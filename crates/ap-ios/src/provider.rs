@@ -118,45 +118,64 @@ async fn tcp_reachable(ip: IpAddr, port: u16) -> bool {
     )
 }
 
+/// True when a `_apple-mobdev2._tcp` entry belongs to the saved device: by
+/// the Wi-Fi MAC in the instance name, or (iOS 26.4+) by the `identifier`
+/// and `authTag` TXT values derived from the pairing's HostID. mdns-sd keeps
+/// only the first value of a repeated TXT key, so only one `authTag` is
+/// checked.
+pub(crate) fn mobdev2_matches(f: &Found, mac: &str, host_id: Option<&str>) -> bool {
+    if f.service != mdns::MOBDEV2 {
+        return false;
+    }
+    if !mac.is_empty() && f.mobdev2_mac().as_deref() == Some(mac) {
+        return true;
+    }
+    match (host_id, f.txt.get("identifier"), f.txt.get("authTag")) {
+        (Some(h), Some(id), Some(tag)) => {
+            idevice::mdns::txt_record_matches(h.as_bytes(), id.as_bytes(), &[tag.as_bytes()])
+        }
+        _ => false,
+    }
+}
+
 /// Find a saved device on the network: mDNS first, then the last IP.
 async fn locate(dir: &std::path::Path, rec: &DeviceRecord, found: &[Found]) -> NetworkSpot {
     let mut spot = NetworkSpot::default();
     let mac = mdns::normalize_mac(&rec.wifi_mac);
-    if !mac.is_empty() {
-        spot.lockdown = found
+    let host_id = store::paths(dir, &rec.udid)
+        .ok()
+        .and_then(|p| PairingFile::read_from_file(&p.lockdown).ok())
+        .map(|pf| pf.host_id);
+    spot.lockdown = found
+        .iter()
+        .find(|f| mobdev2_matches(f, &mac, host_id.as_deref()))
+        .and_then(Found::best_addr);
+    if let Ok(p) = store::paths(dir, &rec.udid)
+        && let Ok(bytes) = std::fs::read(&p.remote_pairing)
+        && let Ok(rpf) = idevice::remote_pairing::RpPairingFile::from_bytes(&bytes)
+    {
+        spot.remote_pairing = found
             .iter()
-            .filter(|f| f.service == mdns::MOBDEV2)
-            .find(|f| f.mobdev2_mac().as_deref() == Some(mac.as_str()))
-            .and_then(Found::best_addr);
+            .filter(|f| f.service == mdns::REMOTE_PAIRING)
+            .find(|f| {
+                let id = f.txt.get("identifier").map(String::as_str).unwrap_or("");
+                let tag = f.txt.get("authTag").map(String::as_str).unwrap_or("");
+                tunnel::rp_matches(&rpf, id, tag)
+            })
+            .and_then(|f| {
+                f.best_addr().map(|(ip, scope)| match (ip, scope) {
+                    (IpAddr::V6(v6), Some(s)) => {
+                        SocketAddr::V6(std::net::SocketAddrV6::new(v6, f.port, 0, s))
+                    }
+                    _ => SocketAddr::new(ip, f.port),
+                })
+            });
     }
-    if let Ok(p) = store::paths(dir, &rec.udid) {
-        if let Ok(bytes) = std::fs::read(&p.remote_pairing) {
-            if let Ok(rpf) = idevice::remote_pairing::RpPairingFile::from_bytes(&bytes) {
-                spot.remote_pairing = found
-                    .iter()
-                    .filter(|f| f.service == mdns::REMOTE_PAIRING)
-                    .find(|f| {
-                        let id = f.txt.get("identifier").map(String::as_str).unwrap_or("");
-                        let tag = f.txt.get("authTag").map(String::as_str).unwrap_or("");
-                        tunnel::rp_matches(&rpf, id, tag)
-                    })
-                    .and_then(|f| {
-                        f.best_addr().map(|(ip, scope)| match (ip, scope) {
-                            (IpAddr::V6(v6), Some(s)) => {
-                                SocketAddr::V6(std::net::SocketAddrV6::new(v6, f.port, 0, s))
-                            }
-                            _ => SocketAddr::new(ip, f.port),
-                        })
-                    });
-            }
-        }
-    }
-    if spot.lockdown.is_none() {
-        if let Some(ip) = rec.last_ip {
-            if tcp_reachable(ip, LOCKDOWN_PORT).await {
-                spot.lockdown = Some((ip, None));
-            }
-        }
+    if spot.lockdown.is_none()
+        && let Some(ip) = rec.last_ip
+        && tcp_reachable(ip, LOCKDOWN_PORT).await
+    {
+        spot.lockdown = Some((ip, None));
     }
     spot
 }
@@ -235,7 +254,9 @@ pub(crate) async fn resolve(cfg: &IosConfig, id: &str) -> Result<Resolved> {
     // 1. usbmuxd (USB first, then usbmuxd's Wi-Fi sync entry).
     if let Some(dev) = mux_devs.iter().find(|d| d.udid == udid) {
         let p: Arc<dyn IdeviceProvider> = Arc::from(connect::usbmuxd_provider(dev)?);
-        let li = Box::pin(connect::lockdown_info(&*p)).await?;
+        let li = tokio::time::timeout(QUERY_TIMEOUT, Box::pin(connect::lockdown_info(&*p)))
+            .await
+            .map_err(|_| Error::Timeout(QUERY_TIMEOUT))??;
         if !li.trusted {
             return Err(Error::setup(
                 "this computer is not trusted by the iPhone",
@@ -267,19 +288,19 @@ pub(crate) async fn resolve(cfg: &IosConfig, id: &str) -> Result<Resolved> {
     let mut lockdown: Option<Arc<dyn IdeviceProvider>> = None;
     let mut info = record_info(&rec);
     let mut version = IosVersion::parse(&rec.os_version);
-    if let Some((ip, scope)) = spot.lockdown {
-        if let Ok(pf) = PairingFile::read_from_file(&paths.lockdown) {
-            let p: Arc<dyn IdeviceProvider> = Arc::from(connect::tcp_provider(ip, scope, pf));
-            match tokio::time::timeout(QUERY_TIMEOUT, Box::pin(connect::lockdown_info(&*p))).await {
-                Ok(Ok(li)) if li.trusted => {
-                    version = IosVersion::parse(&li.product_version).or(version);
-                    info = device_info(&udid, &li, "hid");
-                    lockdown = Some(p);
-                }
-                Ok(Ok(_)) => tracing::info!("Wi-Fi lockdown at {ip}: not trusted"),
-                Ok(Err(e)) => tracing::info!("Wi-Fi lockdown at {ip}: {e}"),
-                Err(_) => tracing::info!("Wi-Fi lockdown at {ip}: timed out"),
+    if let Some((ip, scope)) = spot.lockdown
+        && let Ok(pf) = PairingFile::read_from_file(&paths.lockdown)
+    {
+        let p: Arc<dyn IdeviceProvider> = Arc::from(connect::tcp_provider(ip, scope, pf));
+        match tokio::time::timeout(QUERY_TIMEOUT, Box::pin(connect::lockdown_info(&*p))).await {
+            Ok(Ok(li)) if li.trusted => {
+                version = IosVersion::parse(&li.product_version).or(version);
+                info = device_info(&udid, &li, "hid");
+                lockdown = Some(p);
             }
+            Ok(Ok(_)) => tracing::info!("Wi-Fi lockdown at {ip}: not trusted"),
+            Ok(Err(e)) => tracing::info!("Wi-Fi lockdown at {ip}: {e}"),
+            Err(_) => tracing::info!("Wi-Fi lockdown at {ip}: timed out"),
         }
     }
     let remote_pairing = spot
@@ -426,6 +447,50 @@ mod tests {
         assert_eq!(i.screen_points, ap_core::Size::new(390.0, 844.0));
         assert_eq!(i.backend, "unsupported");
         assert_eq!(backend_for("26.1"), "hid");
+    }
+
+    #[test]
+    fn mobdev2_match_by_mac_or_auth_tag() {
+        fn b64(bytes: &[u8]) -> String {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for c in bytes.chunks(3) {
+                let n = (u32::from(c[0]) << 16)
+                    | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*c.get(2).unwrap_or(&0));
+                for i in 0..4 {
+                    if i <= c.len() {
+                        out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
+        }
+        let host_id = "6A1B2C3D-0000-1111-2222-333344445555";
+        let identifier = "ABCDEF012345";
+        let tag = b64(&idevice::mdns::derive_auth_tag(
+            host_id.as_bytes(),
+            identifier.as_bytes(),
+        ));
+        let mut f = Found {
+            service: mdns::MOBDEV2,
+            instance: "aa:bb:cc:dd:ee:ff@fe80::1".into(),
+            addrs: vec![("192.168.1.2".parse().unwrap(), 0)],
+            port: 62078,
+            txt: Default::default(),
+        };
+        assert!(mobdev2_matches(&f, "aa:bb:cc:dd:ee:ff", None));
+        assert!(!mobdev2_matches(&f, "11:22:33:44:55:66", Some(host_id)));
+        // iOS 26.4+: no MAC match, but the auth tag matches the HostID.
+        f.instance = "random-name".into();
+        f.txt.insert("identifier".into(), identifier.into());
+        f.txt.insert("authTag".into(), tag);
+        assert!(mobdev2_matches(&f, "aa:bb:cc:dd:ee:ff", Some(host_id)));
+        assert!(!mobdev2_matches(&f, "", Some("other-host")));
+        f.service = mdns::REMOTE_PAIRING;
+        assert!(!mobdev2_matches(&f, "", Some(host_id)));
     }
 
     #[tokio::test]

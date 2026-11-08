@@ -17,6 +17,8 @@ use std::time::Duration;
 use ap_core::{Button, Capabilities, Error, Frame, Key, Point, Result};
 use async_trait::async_trait;
 
+use crate::cancel::CancelCheck;
+
 /// One way to drive an iPhone. All points are normalized (0..1).
 #[async_trait(?Send)]
 pub trait IosBackend {
@@ -62,6 +64,14 @@ pub trait IosBackend {
     async fn ui_tree(&mut self) -> Result<Option<String>> {
         Err(Error::unsupported("ui_tree"))
     }
+
+    /// The cancel check for the call that starts next. Long actions check it
+    /// between strokes and points (see `crate::cancel`).
+    fn set_cancel(&mut self, _cancel: CancelCheck) {}
+
+    /// The worker stopped the running call at its deadline. The session may
+    /// be mid-read: drop it without a clean close, so the next call reconnects.
+    fn abandon(&mut self) {}
 
     /// Close sessions. Called when the device is dropped.
     async fn shutdown(&mut self) {}
