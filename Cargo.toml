@@ -19,7 +19,9 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Minimum: let-chains, image 0.25.10 and rmcp 3.9.0 need 1.88. The `ocr` feature
+# (rten 0.26.0) needs 1.94. CI checks 1.88 in the `msrv` job.
+rust-version = "1.88"
 license = "MIT"
 authors = ["AgentPhone contributors", "Aleksey Smolenchuk (original phoneuse)"]
 repository = "https://github.com/bard58/phoneuse"

@@ -26,19 +26,33 @@ pub const DEFAULT_BLOCKLIST: &[&str] = &[
     "com.squareup.cash",
     "coinbase",
     "binance",
-    // Wallet
+    // Android bank and payment package ids that contain no word above.
+    "com.chase.sig.android",
+    "com.wf.wellsfargomobile",
+    "com.infonow.bofa",
+    "com.citi.citimobile",
+    "com.konylabs.capitalone",
+    "com.google.android.apps.nbu.paisa.user",
+    // Wallet ("wallet" also matches com.google.android.apps.walletnfcrel)
     "wallet",
     "com.apple.passbook",
     // Messages and mail
     "messages",
+    "messaging",
     "com.apple.mobilesms",
     "com.google.android.apps.messaging",
+    "com.samsung.android.messaging",
+    "com.android.mms",
     "whatsapp",
     "signal",
+    "org.thoughtcrime.securesms",
     "telegram",
     "messenger",
+    "com.facebook.orca",
     "com.apple.mobilemail",
     "gmail",
+    "com.google.android.gm",
+    "com.microsoft.office.outlook",
     // Password managers and authenticators
     "password",
     "1password",
@@ -218,6 +232,28 @@ mod tests {
         }
         p.set_foreground_app(Some("WhatsApp".into()));
         assert!(refused(p.check()));
+        // Real Android package ids (dumpsys gives only the id, not the label).
+        for app in [
+            "com.google.android.gm",
+            "org.thoughtcrime.securesms",
+            "com.facebook.orca",
+            "com.samsung.android.messaging",
+            "com.android.mms",
+            "com.microsoft.office.outlook",
+            "com.google.android.apps.walletnfcrel",
+            "com.google.android.apps.nbu.paisa.user",
+            "com.google.android.apps.photos",
+            "com.chase.sig.android",
+            "com.wf.wellsfargomobile",
+            "com.whatsapp",
+            "org.telegram.messenger",
+            "com.google.android.apps.authenticator2",
+        ] {
+            assert!(refused(p.check_app(Some(app))), "{app} should be blocked");
+        }
+        for app in ["com.android.settings", "com.google.android.youtube"] {
+            assert!(p.check_app(Some(app)).is_ok(), "{app} should pass");
+        }
         p.set_foreground_app(Some("Settings".into()));
         assert!(p.check().is_ok());
         // Unknown app: refused by default.

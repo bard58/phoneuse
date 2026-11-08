@@ -45,3 +45,18 @@ jobs:
             target/release/agentphone
             target/release/agentphone.exe
           if-no-files-found: error
+
+  msrv:
+    # rust-version in Cargo.toml. The `ocr` feature needs Rust 1.94, so this
+    # job checks the default features only.
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Install Linux deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - run: cargo check --workspace --all-targets --locked

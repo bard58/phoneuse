@@ -168,7 +168,7 @@ impl HttpTransport {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|s| s.is_finite() && *s >= 0.0)
-            .map(Duration::from_secs_f64);
+            .and_then(|s| Duration::try_from_secs_f64(s.min(3600.0)).ok());
         let body = resp.text().await.map_err(map_reqwest)?;
         if (200..300).contains(&status) {
             return serde_json::from_str(&body).map_err(|e| {

@@ -149,6 +149,13 @@ pub trait Device: Send + Sync {
     async fn home(&self) -> Result<()> {
         self.button(Button::Home).await
     }
+
+    /// Stop the calls that were sent before now, as far as the backend can.
+    /// A host calls this when the owner cancels (for example Ctrl+C), in
+    /// addition to dropping the call's future. Calls sent after this run
+    /// normally. The default does nothing: the backend then stops only when
+    /// the dropped future stops it.
+    fn cancel(&self) {}
 }
 
 /// Finds and connects devices of one kind (iOS over usbmuxd, Android over adb, ...).
