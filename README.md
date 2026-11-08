@@ -14,10 +14,12 @@ agentphone is early software. Read this before you use it.
 - The code builds and the unit tests pass on Windows.
 - Nobody tested agentphone on a real phone yet. Every device path (iPhone and
   Android) is unverified.
-- iPhone touch input uses the CoreDevice HID services. These services are
-  known on iOS 26. On iOS 17.4 to 17.x they are expected to be missing, and on
-  iOS 18 nobody knows. Thus touch input on those versions can fail.
-  `agentphone doctor` shows this as the "Touch and keyboard input" check.
+- iPhone touch input uses the CoreDevice HID services. Public reports show
+  that these services accept input only on iOS 27 and later. On iOS 17.4 to
+  26.x, the iPhone refuses the display stream (CoreDevice error 9021), so
+  touch and keyboard input do not work there. Screenshots can still work.
+  `agentphone doctor` shows the services as the "Touch and keyboard input"
+  check.
 - Report problems in the issue tracker of
   [bard58/phoneuse](https://github.com/bard58/phoneuse/issues).
 
@@ -69,9 +71,9 @@ See [docs/agent.md](docs/agent.md#safety-rules) for the full rules.
 
 | Phone | Requirement | Connection | Status |
 |---|---|---|---|
-| iPhone 11 and newer | iOS 17.4 or later, Developer Mode, one USB pairing | USB, then Wi-Fi | unverified on a device. The input code targets iOS 26. |
-| iPhone 13 | iOS 17.4 to 26 | USB, then Wi-Fi | target model, unverified on a device |
-| iPhone XS, XS Max, XR | iOS 17.4 to 18 (the last iOS for these models), Developer Mode, one USB pairing | USB, then Wi-Fi | agentphone connects, but touch input is expected to be missing on iOS 17.4 to 17.x and is unknown on iOS 18. Screenshots can work without input. Unverified on a device. |
+| iPhone 11 and newer | iOS 17.4 or later, Developer Mode, one USB pairing. Touch input needs iOS 27 or later. | USB, then Wi-Fi | unverified on a device |
+| iPhone 13 | iOS 17.4 to 27. Touch input needs iOS 27. | USB, then Wi-Fi | target model, unverified on a device |
+| iPhone XS, XS Max, XR | iOS 17.4 to 18 (the last iOS for these models), Developer Mode, one USB pairing | USB, then Wi-Fi | agentphone connects, but touch input does not work, because these models cannot get iOS 27. Screenshots can work without input. Unverified on a device. |
 | iPhone with iOS 17.3 or earlier | not supported. Update iOS. | - | - |
 | Android phone | USB debugging | USB, or Wi-Fi (Android 11 or later, `adb pair`) | unverified on a device |
 
@@ -89,6 +91,7 @@ agentphone needs no administrator rights.
 |---|---|
 | `agentphone setup [ios\|android\|llm\|mcp\|ocr]` | Step-by-step setup. You can run it again. |
 | `agentphone doctor` | Examines the setup and prints one fix for each problem. |
+| `agentphone selftest [--out DIR] [--yes]` | First-run test on the phone: setup, connection, screenshot, then Home and one swipe after you answer y. Writes `selftest-report.json` for the developer. |
 | `agentphone devices`, `use <id>`, `info` | Lists phones, sets the default phone, shows details. |
 | `agentphone screenshot [-o FILE] [--grid]` | Saves a PNG of the screen. |
 | `agentphone tap X Y`, `long-press X Y`, `swipe X1 Y1 X2 Y2` | Touch input. X and Y are fractions from 0 to 1. Add `--px` for pixels of the saved screenshot. |

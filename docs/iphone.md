@@ -12,10 +12,11 @@ rights. It needs a USB cable one time. After the setup, it can also use Wi-Fi.
 ## Requirements
 
 - An iPhone with iOS 17.4 or later. iOS 17.3 and earlier are not supported.
-  The input code targets iOS 26.
+  Touch and keyboard input need iOS 27 or later. On iOS 17.4 to 26.x, the
+  iPhone refuses the display stream (CoreDevice error 9021), and only
+  screenshots can work.
 - iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
-  touch input is expected to be missing on iOS 17.4 to 17.x and is unknown on
-  iOS 18. The `hid_services` check of `agentphone doctor` tells you.
+  touch input does not work, because these models cannot get iOS 27.
 - A USB data cable (the cable in the box is correct).
 - The passcode of the iPhone. You type it on the iPhone, not in agentphone.
 - An Internet connection for the first setup and after each restart of the
@@ -115,10 +116,43 @@ mDNS. agentphone finds the iPhone by its Wi-Fi MAC address, or by the
 address. On a Wi-Fi reconnect, agentphone uses only the saved pairing. It
 never starts a new pairing. The Wi-Fi path is unverified.
 
-## 7. Make sure it works
+## 7. Make sure it works (first run)
+
+1. Unlock the iPhone and go to the home screen.
+2. Run:
+
+   ```sh
+   agentphone selftest
+   ```
+
+3. When agentphone asks "Start the input test?", type `y`. The default is no.
+4. Send `selftest/selftest-report.json` to the developer.
+
+The self-test does these steps in order:
+
+1. It runs the `agentphone doctor` checks. If a check fails, the test stops and
+   shows the fix.
+2. It connects to the iPhone and shows the model, the iOS version, and the
+   screen size.
+3. It saves a screenshot in the `selftest` folder. Use `--out DIR` to change
+   the folder.
+4. Only after you type `y`, it presses Home, swipes one time from left to
+   right on the home screen, and presses Home again. After each action, it
+   compares a new screenshot with the previous one. It does not type text and
+   does not tap.
+
+Each step shows PASS, FAIL, or SKIP, one reason, and one fix. The test also
+writes `selftest-report.txt`. The report contains no secrets and only the
+last 4 characters of the UDID. Press Ctrl+C to stop the test. The report
+then keeps the results until that point.
+
+`--yes` starts the input test without the question. Without a terminal and
+without `--yes`, the input test is skipped. The exit code is 0 when all steps
+that ran pass, and 1 when a step fails or you press Ctrl+C.
+
+For a single manual test, use these commands:
 
 ```sh
-agentphone doctor
 agentphone screenshot -o screen.png
 agentphone tap 0.5 0.5
 ```
@@ -182,9 +216,11 @@ problem, then run `agentphone doctor` again.
 - Typing uses a US keyboard layout. For text with accents, other scripts, or
   emoji, agentphone puts the text on the pasteboard and sends Cmd+V. This
   fallback is unverified.
-- On iOS 17.4 to 17.x, the HID services are expected to be missing. On iOS 18,
-  nobody knows. iOS 26 is the main target of the input code. This includes
-  every iPhone XS, XS Max, and XR, because they stop at iOS 18.
+- Touch and keyboard input need iOS 27 or later. On iOS 17.4 to 26.x, the
+  iPhone refuses the display stream with CoreDevice error 9021. This includes
+  every iPhone XS, XS Max, and XR, because they stop at iOS 18. The
+  `hid_services` check can pass on these versions, because the services
+  exist, but input still fails.
 - iOS has no query for the open app on this route. agentphone knows the app
   only right after `open_app`. After any input, the app is unknown.
 - A later iOS version can refuse the display service that agentphone opens

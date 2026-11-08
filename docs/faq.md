@@ -12,13 +12,17 @@ on the iPhone. Windows needs the Apple Devices app or iTunes.
 
 ## Which iPhones work?
 
-iPhones with iOS 17.4 or later. The input code targets iOS 26, so an iPhone 11
-or newer is the best choice. The iPhone 13 is a main target (iOS 17.4 to 26).
+agentphone connects to iPhones with iOS 17.4 or later. Touch and keyboard
+input need iOS 27 or later, so use an iPhone 11 or newer with iOS 27. The
+iPhone 13 is a main target. On iOS 17.4 to 26.x, the iPhone refuses the
+display stream (CoreDevice error 9021), and only screenshots can work.
 
 iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
-touch input is expected to be missing on iOS 17.4 to 17.x, and nobody knows
-about iOS 18. Run `agentphone doctor`. If the "Touch and keyboard input" check
-fails, agentphone cannot control that iPhone.
+touch input does not work, because these models cannot get iOS 27.
+
+Run `agentphone doctor`. If the "Touch and keyboard input" check fails,
+agentphone cannot control that iPhone. Below iOS 27, the check can pass and
+input still fails.
 
 ## Why does an iPhone need Developer Mode?
 

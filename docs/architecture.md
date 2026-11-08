@@ -76,9 +76,16 @@ key `ios.backend_order` keeps room for more routes.
 | 15 | not supported, update iOS | - | - | - |
 | 16 | not supported, update iOS | - | - | - |
 | 17.0 to 17.3 | not supported, update iOS | - | - | - |
-| 17.4 to 17.x | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID (expected to be missing) | DVT |
-| 18 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID (unknown) | DVT |
-| 26 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID + displayservice gate | DVT |
+| 17.4 to 17.x | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: the stream is refused (reported, no 17.x device log) | DVT |
+| 18 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: error 9021 (reported on 18.7.3) | DVT |
+| 26 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: error 9021 (reported on 26.3 and 26.7) | DVT |
+| 27 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID + displayservice gate | DVT |
+
+Evidence for the input column (public reports, not tested with agentphone):
+[go-ios PR #843](https://github.com/danielpaulus/go-ios/pull/843),
+[go-ios PR #849](https://github.com/danielpaulus/go-ios/pull/849),
+[quern issue #624](https://github.com/quern-dev/quern/issues/624),
+[pymobiledevice3 issue #2036](https://github.com/doronz88/pymobiledevice3/issues/2036).
 
 Design notes for `ap-ios`:
 
@@ -105,8 +112,8 @@ Design notes for `ap-ios`:
 - `foreground_app` gives the app of the last `launch_app` only until the next
   input. Any input can open a different app.
 - iPhone XS, XS Max, and XR stop at iOS 18 (`max_ios_major` in
-  `crates/ap-ios/src/models.rs`). agentphone does not block them, but their
-  iOS range is the one where HID is expected to be missing or unknown.
+  `crates/ap-ios/src/models.rs`). agentphone does not block them, but they
+  cannot get iOS 27, so HID input does not work on them.
 - Touch uses `UniversalHidServiceClient` with coordinates from 0 to 65535. Keys
   and buttons use `IndigoHidClient`.
 - `launch_app` uses DVT process control. `list_apps` uses installation_proxy.
@@ -117,7 +124,7 @@ Design notes for `ap-ios`:
 | Id | Risk |
 |---|---|
 | R1 | Nothing ran on a device. |
-| R2 | The iOS range of CoreDevice HID is not known. iOS 26 is the main target. |
+| R2 | Public reports show that CoreDevice HID input works only on iOS 27 and later. Nobody tested ap-ios on iOS 27. |
 | R3 | On iOS 18 and 26, the personalized DDI can be refused. Then a Cryptex1 DDI is necessary. |
 | R4 | Apple TSS needs Internet for the first mount after each restart. |
 | R6 | `usbmuxd` is a closed Apple service on Windows. Without it, there is no USB path. |
