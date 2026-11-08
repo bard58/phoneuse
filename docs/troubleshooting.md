@@ -25,6 +25,13 @@ The phone checks are in [iphone.md](iphone.md#troubleshooting) and
 | iPhone works on USB but not after a restart | The iPhone removed the DDI. Run `agentphone setup ios`. |
 | The agent stops with "step limit" | Use `--max-steps` with a larger number. |
 | MCP client shows no tools | Use the full path of `agentphone` in the client config. Restart the client. |
+| `cargo install` fails with "requires rustc 1.88" or a let-chain error | Run `rustup update`. agentphone needs Rust 1.88. With `--features ocr`, it needs Rust 1.94. |
+| "input may be partly delivered" | The connection dropped while the phone got the input. agentphone does not send it again. Look at the screen, then do the action again if necessary. |
+| "may or may not have reached the phone" (MCP) | The same problem in MCP mode. The agent must call `look` before it tries again. |
+| A time-out error on an iPhone | agentphone closed the session. The next command opens a new one. If it continues, unlock the iPhone and connect the cable again. |
+| "OCR for tap-on" shows "not found" or "checksum mismatch" in an OCR build | A model file is missing, or its SHA-256 does not agree with the pinned value. Run `agentphone setup ocr`. |
+| `--jev` says it needs a terminal | The consent question needs a terminal. Run the command in a terminal, or run it without `--jev`. |
+| The agent refuses digits | 4 or more digits can be a passcode. Approve the exact call in the terminal, or type the digits yourself. |
 
 ## Report a problem
 

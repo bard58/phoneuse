@@ -12,9 +12,13 @@ on the iPhone. Windows needs the Apple Devices app or iTunes.
 
 ## Which iPhones work?
 
-iPhones with iOS 17.4 or later. iPhone XS, XR, and newer models can run this
-version. The iPhone 13 is a main target (iOS 17.4 to 26). Touch input on iOS
-17.4 to 18 is less certain than on iOS 26.
+iPhones with iOS 17.4 or later. The input code targets iOS 26, so an iPhone 11
+or newer is the best choice. The iPhone 13 is a main target (iOS 17.4 to 26).
+
+iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
+touch input is expected to be missing on iOS 17.4 to 17.x, and nobody knows
+about iOS 18. Run `agentphone doctor`. If the "Touch and keyboard input" check
+fails, agentphone cannot control that iPhone.
 
 ## Why does an iPhone need Developer Mode?
 
@@ -43,13 +47,22 @@ agentphone does not store it. It reads the key from an environment variable.
 
 ## Can the agent buy something or send a message without me?
 
-Not with the default settings. The agent asks you before each irreversible
-action. Push Ctrl+C to stop it at any time.
+With the default settings, agentphone asks you first. The model must ask
+before each irreversible action. agentphone also asks before Enter, before
+text with a newline, and before a tap right after typing in a messaging,
+payment, or shopping app.
+
+These checks lower the risk, but they do not remove it. Some depend on the
+model, and some depend on what is on the screen. Push Ctrl+C to stop the agent
+at any time. Ctrl+C is the hard stop. See
+[agent.md](agent.md#safety-rules).
 
 ## Can the agent unlock my phone?
 
 No. The agent never types a passcode. When the phone is locked, it asks you to
-unlock it.
+unlock it. agentphone also refuses 4 or more digits unless you approve that
+exact call, and it refuses all text and keys while the phone looks locked. It
+cannot find a password that has letters.
 
 ## Does agentphone send my screen anywhere?
 

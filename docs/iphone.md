@@ -11,8 +11,11 @@ rights. It needs a USB cable one time. After the setup, it can also use Wi-Fi.
 
 ## Requirements
 
-- An iPhone with iOS 17.4 or later. iPhone XS, XR, and newer models can run
-  iOS 17.4. iOS 17.3 and earlier are not supported.
+- An iPhone with iOS 17.4 or later. iOS 17.3 and earlier are not supported.
+  The input code targets iOS 26.
+- iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
+  touch input is expected to be missing on iOS 17.4 to 17.x and is unknown on
+  iOS 18. The `hid_services` check of `agentphone doctor` tells you.
 - A USB data cable (the cable in the box is correct).
 - The passcode of the iPhone. You type it on the iPhone, not in agentphone.
 - An Internet connection for the first setup and after each restart of the
@@ -107,8 +110,10 @@ because Apple must sign the image for your iPhone.
 4. Run `agentphone devices` and make sure that the iPhone is in the list.
 
 The iPhone and the computer must be on the same network. Wi-Fi discovery uses
-mDNS. If mDNS fails, agentphone tries the last known IP address. The Wi-Fi
-path is unverified.
+mDNS. agentphone finds the iPhone by its Wi-Fi MAC address, or by the
+`authTag` of the pairing. If mDNS fails, agentphone tries the last known IP
+address. On a Wi-Fi reconnect, agentphone uses only the saved pairing. It
+never starts a new pairing. The Wi-Fi path is unverified.
 
 ## 7. Make sure it works
 
@@ -128,8 +133,29 @@ agentphone tap 0.5 0.5
 > CAUTION: Keep the pairing files private. A person with these files can
 > control your iPhone. Set `ios.pairing_dir` to keep them in a different folder.
 
+On macOS and Linux, agentphone makes the folder with mode 700 and each file
+with mode 600. On Windows, the files get the access rules of the folder. The
+default folder is private to your user. If you set `ios.pairing_dir`, use a
+folder that only your user can read.
+
 To use a different DDI mirror, set the environment variable
-`AGENTPHONE_DDI_MIRROR` to a base URL that ends with `/`.
+`AGENTPHONE_DDI_MIRROR` to a base URL that ends with `/`. The DDI download
+stops when the connection takes more than 15 seconds, or when no data comes
+for 60 seconds.
+
+## Time limits and retries
+
+- Each iPhone call has a time limit. The limit is 30 seconds for the setup,
+  plus the expected time of the work, plus 10 seconds. If the limit expires,
+  agentphone closes the session and returns a time-out error. The next call
+  opens a new session.
+- agentphone retries a screenshot, the pasteboard, and an app launch one time
+  after a connection error.
+- agentphone sends input again only when the error came before the first
+  event reached the iPhone. After that, it does not retry. The error says
+  "input may be partly delivered". Look at the screen before you try again.
+- If a gesture or a key stroke stops with an error, agentphone tries to
+  release the touch or the key.
 
 ## Troubleshooting
 
@@ -156,7 +182,10 @@ problem, then run `agentphone doctor` again.
 - Typing uses a US keyboard layout. For text with accents, other scripts, or
   emoji, agentphone puts the text on the pasteboard and sends Cmd+V. This
   fallback is unverified.
-- On iOS 17.4 to 18, the HID services can be missing. iOS 26 is the main
-  target of the input code.
+- On iOS 17.4 to 17.x, the HID services are expected to be missing. On iOS 18,
+  nobody knows. iOS 26 is the main target of the input code. This includes
+  every iPhone XS, XS Max, and XR, because they stop at iOS 18.
+- iOS has no query for the open app on this route. agentphone knows the app
+  only right after `open_app`. After any input, the app is unknown.
 - A later iOS version can refuse the display service that agentphone opens
   for input.

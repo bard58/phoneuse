@@ -1,7 +1,10 @@
 # Architecture
 
 agentphone is a Cargo workspace. The binary is `agentphone` (crate `ap-cli`).
-All crates use Rust edition 2024 and deny `unsafe` code.
+All crates use Rust edition 2024 and deny `unsafe` code. The minimum Rust
+version is 1.88 (`rust-version` in `Cargo.toml`). The `ocr` feature needs
+Rust 1.94, because `rten` 0.26.0 needs it. The CI job `msrv` checks the
+default features with Rust 1.88.
 
 ## Crate map
 
@@ -11,7 +14,7 @@ All crates use Rust edition 2024 and deny `unsafe` code.
 | `ap-ios` | iPhone backend (iOS 17.4 and later) through the `idevice` crate, pinned to `=0.1.68`. |
 | `ap-android` | Android backend through a small async client for the local adb server. |
 | `ap-screen` | Settle detection, frame strips, downscale and JPEG encoding, coordinate grid. Works on any `Device`. |
-| `ap-vision` | Optional OCR (`ocr` feature, `ocrs` engine). Models download at runtime with SHA-256 verification. |
+| `ap-vision` | Optional OCR (`ocr` feature, `ocrs` engine). Models download at runtime. Their SHA-256 is pinned in the code and checked at download and at load time. |
 | `ap-llm` | LLM clients: Anthropic Messages API and OpenAI-compatible `/chat/completions`. Prices for cost estimates. |
 | `ap-agent` | The agent loop: observe, call the model, act, repeat. Safety gates and take-over. |
 | `ap-mcp` | MCP server over stdio and loopback HTTP. 16 tools. |
@@ -73,7 +76,7 @@ key `ios.backend_order` keeps room for more routes.
 | 15 | not supported, update iOS | - | - | - |
 | 16 | not supported, update iOS | - | - | - |
 | 17.0 to 17.3 | not supported, update iOS | - | - | - |
-| 17.4 to 17.x | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID (can be missing) | DVT |
+| 17.4 to 17.x | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID (expected to be missing) | DVT |
 | 18 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID (unknown) | DVT |
 | 26 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID + displayservice gate | DVT |
 
@@ -85,6 +88,25 @@ Design notes for `ap-ios`:
 - `HidBackend` keeps one tunnel and one displayservice media stream for each
   session. The media stream is the gate for HID input. Two tasks read and drop
   the RTP data.
+- A transport error closes the session, and the next call opens a new one.
+  Input is not replayed. An input call runs once more only when the error
+  came before its first event. Otherwise it returns an "input may be partly
+  delivered" error. Screenshot, pasteboard, and launch get one full retry.
+- On an error or a cancel in a gesture or a key stroke, the backend sends the
+  touch release or the key up as best effort, with a limit of 1 second.
+- Each attempt has a time limit (setup, plus expected work, plus slack). The
+  worker thread also stops a job at a backstop deadline and drops the
+  session. An expired limit gives `Error::Timeout`.
+- `IosDevice::cancel_handle()` gives a `CancelHandle`. `cancel()` stops the
+  calls sent before it. `Device::cancel()` (a default method that does
+  nothing) calls it for an iPhone. The agent calls it on Ctrl+C, and the MCP
+  server calls it when an action passes its time limit or `end_session`
+  abandons an action.
+- `foreground_app` gives the app of the last `launch_app` only until the next
+  input. Any input can open a different app.
+- iPhone XS, XS Max, and XR stop at iOS 18 (`max_ios_major` in
+  `crates/ap-ios/src/models.rs`). agentphone does not block them, but their
+  iOS range is the one where HID is expected to be missing or unknown.
 - Touch uses `UniversalHidServiceClient` with coordinates from 0 to 65535. Keys
   and buttons use `IndigoHidClient`.
 - `launch_app` uses DVT process control. `list_apps` uses installation_proxy.
@@ -111,7 +133,9 @@ The full list is in `crates/ap-ios/README.md`.
 2. `ap-screen` downscales the frame and encodes it as JPEG.
 3. `ap-llm` sends the frame and the tool list to the model.
 4. `ap-agent` checks the tool call against the safety rules, then calls the
-   `Device`.
+   `Device`. Some rules depend on the model (the `irreversible` flag). Others
+   run in the host: Enter, newlines, a tap after typing, digit runs, and the
+   lock screen. See [agent.md](agent.md#safety-rules).
 5. `ap-screen` makes a frame strip of the screen after the action.
 6. The loop repeats until the model calls `done`, the step limit is reached, or
    the host cancels the run.

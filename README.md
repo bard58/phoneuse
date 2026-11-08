@@ -15,9 +15,9 @@ agentphone is early software. Read this before you use it.
 - Nobody tested agentphone on a real phone yet. Every device path (iPhone and
   Android) is unverified.
 - iPhone touch input uses the CoreDevice HID services. These services are
-  known on iOS 26. On iOS 17.4 to 18 they can be missing, so touch input on
-  those versions can fail. `agentphone doctor` shows this as the
-  "Touch and keyboard input" check.
+  known on iOS 26. On iOS 17.4 to 17.x they are expected to be missing, and on
+  iOS 18 nobody knows. Thus touch input on those versions can fail.
+  `agentphone doctor` shows this as the "Touch and keyboard input" check.
 - Report problems in the issue tracker of
   [bard58/phoneuse](https://github.com/bard58/phoneuse/issues).
 
@@ -25,11 +25,13 @@ agentphone is early software. Read this before you use it.
 
 1. Get the binary. Download `agentphone.exe` from the
    [releases page](https://github.com/bard58/phoneuse/releases)
-   (no release is published yet), or build it with Rust:
+   (no release is published yet), or build it with Rust 1.88 or later:
 
    ```powershell
    cargo install --git https://github.com/bard58/phoneuse --branch rust-rewrite ap-cli
    ```
+
+   The `ocr` feature needs Rust 1.94 or later.
 
 2. Open a terminal and run `agentphone`. On the first run, the setup wizard
    starts.
@@ -50,12 +52,26 @@ agentphone is early software. Read this before you use it.
 
 Run `agentphone doctor` when something does not work.
 
+## Safety in short
+
+- The agent asks you before it sends, pays, buys, or deletes. agentphone also
+  asks you before Enter, before text with a newline, and before a tap right
+  after typing in a messaging, payment, or shopping app.
+- agentphone refuses digit runs that look like a passcode, unless you approve
+  that exact call.
+- Push Ctrl+C to stop the agent. This is the hard stop. The other checks lower
+  the risk, but they depend partly on the AI model and on what is on the
+  screen.
+
+See [docs/agent.md](docs/agent.md#safety-rules) for the full rules.
+
 ## Supported devices
 
 | Phone | Requirement | Connection | Status |
 |---|---|---|---|
-| iPhone XS, XR, and newer | iOS 17.4 or later, Developer Mode, one USB pairing | USB, then Wi-Fi | unverified on a device |
+| iPhone 11 and newer | iOS 17.4 or later, Developer Mode, one USB pairing | USB, then Wi-Fi | unverified on a device. The input code targets iOS 26. |
 | iPhone 13 | iOS 17.4 to 26 | USB, then Wi-Fi | target model, unverified on a device |
+| iPhone XS, XS Max, XR | iOS 17.4 to 18 (the last iOS for these models), Developer Mode, one USB pairing | USB, then Wi-Fi | agentphone connects, but touch input is expected to be missing on iOS 17.4 to 17.x and is unknown on iOS 18. Screenshots can work without input. Unverified on a device. |
 | iPhone with iOS 17.3 or earlier | not supported. Update iOS. | - | - |
 | Android phone | USB debugging | USB, or Wi-Fi (Android 11 or later, `adb pair`) | unverified on a device |
 
@@ -75,7 +91,8 @@ agentphone needs no administrator rights.
 | `agentphone doctor` | Examines the setup and prints one fix for each problem. |
 | `agentphone devices`, `use <id>`, `info` | Lists phones, sets the default phone, shows details. |
 | `agentphone screenshot [-o FILE] [--grid]` | Saves a PNG of the screen. |
-| `agentphone tap X Y`, `long-press X Y`, `swipe X1 Y1 X2 Y2`, `scroll DIR` | Touch input. X and Y are fractions from 0 to 1. Add `--px` for pixels. |
+| `agentphone tap X Y`, `long-press X Y`, `swipe X1 Y1 X2 Y2` | Touch input. X and Y are fractions from 0 to 1. Add `--px` for pixels of the saved screenshot. |
+| `agentphone scroll up\|down\|left\|right [--amount F] [--at X Y]` | Scrolls the content. The amount and `--at` are fractions from 0 to 1. Scroll has no `--px` flag. |
 | `agentphone tap-on "TEXT"` | Finds text on the screen and taps it. Needs OCR. |
 | `agentphone type "TEXT"`, `key KEY`, `button NAME` | Keyboard and hardware buttons. |
 | `agentphone open APP`, `apps`, `ui-tree` | Opens an app, lists apps, prints the UI tree. |

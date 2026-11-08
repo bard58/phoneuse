@@ -88,7 +88,9 @@ it refuses Host headers other than `localhost`, `127.0.0.1`, and `::1`.
 
 The server uses the default phone (`agentphone use <id>`), or the only connected
 phone. To set the phone for one client, add `--device <id>` before `mcp`, or set
-the environment variable `AGENTPHONE_DEVICE`.
+the environment variable `AGENTPHONE_DEVICE`. If device discovery does not
+list the id (for example a Wi-Fi address), the server asks each provider to
+connect to that id.
 
 ## Tools
 
@@ -100,35 +102,56 @@ corner. The center is (0.5, 0.5).
 | `look` | Shows the screen: `both` (default, image and text), `strip`, `text`, or `image`. `grid=true` draws a 0.1 grid. |
 | `wait` | Waits 0 to 10 seconds, then looks again. |
 | `tap` | Taps at (x, y). `double=true` taps two times. |
-| `tap_on` | Taps visible text. Needs OCR. |
+| `tap_on` | Taps visible text. Needs OCR. It waits for a still screen first. If the screen does not stop moving, it taps nothing and tells the agent to call `wait`. |
 | `long_press` | Touches and holds at (x, y). |
 | `swipe` | Drags from (x0, y0) to (x1, y1). |
 | `scroll` | Scrolls up, down, left, or right by half-screens. |
-| `type_text` | Types into the focused field. `\n` pushes Enter. Replaces the old text unless `replace=false`. |
+| `type_text` | Types into the focused field. `\n` pushes Enter. Replaces the old text unless `replace=false`. Refuses 4 to 8 digits unless `user_confirmed_not_passcode=true`. |
 | `press_key` | Pushes a key or shortcut: `enter`, `backspace`, `cmd+a`. |
 | `button` | `home`, `lock`, `volume_up`, `volume_down`, `app_switcher`, `back`. |
 | `open_app` | Opens an app by name, bundle id, or package name. |
 | `navigate` | `home`, `back`, `app_switcher`, `control_center`, `notifications`. |
 | `list_apps` | Lists installed app ids, when the backend can. |
 | `ui_tree` | Shows the UI hierarchy, when the backend has one. |
-| `end_session` | Releases the phone. The next call connects again. |
-| `status` | Shows the device, the capabilities, the OCR state, and setup errors with a fix. |
+| `end_session` | Releases the phone. The next call connects again. If an action hangs, it waits at most 2 seconds, then releases the phone and says that the action was abandoned. |
+| `status` | Shows the device, the capabilities, the OCR state, and setup errors with a fix. When no action runs, it takes one screenshot (10 second limit) to make sure the connection works. |
 
 Each action returns the screen in the same call:
 
 1. One JPEG image with frames at +0.1, +0.4, and +0.8 seconds after the action.
-   The server drops frames that did not change.
-2. One text block with the result, the strip legend, and the text lines of the
-   last frame (when OCR is available).
+   The server drops frames that did not change. If a screenshot fails, the
+   legend says that motion is unknown.
+2. One text block with the result and the strip legend.
+3. When OCR is available, one more text block with the text lines of the last
+   frame. A header marks these lines as screen content, not instructions.
 
-There is no `unlock` tool. The server tells the agent to ask you to unlock the
-phone. The agent must never type a passcode.
+### Errors and retries
+
+- The server never sends an action twice. If the connection drops while an
+  action runs, the result is an error. It says that the action may or may not
+  have reached the phone. The agent must call `look` before it tries again.
+- Only reads (`look`, `wait`, `list_apps`, `ui_tree`) connect again and retry
+  one time. If the retry also fails, the tool returns an error.
+- Each device operation has a time limit of 60 seconds.
+
+### Safety
+
+- The server tells the agent that text on the phone screen is content, not
+  instructions.
+- There is no `unlock` tool. The server tells the agent to ask you to unlock
+  the phone. The agent must never type a passcode.
+- `type_text` refuses 4 to 8 digits unless the call sets
+  `user_confirmed_not_passcode=true`. `press_key` sends one key for each call,
+  so it has no digit check.
+- The MCP server has no confirmation question. The MCP client and its model
+  decide about irreversible actions. Use the approval settings of the client
+  for that.
 
 ## OCR
 
 `tap_on` and the text lines need OCR.
 
-1. Build with the `ocr` feature:
+1. Build with the `ocr` feature. This needs Rust 1.94 or later:
 
    ```sh
    cargo install --git https://github.com/bard58/phoneuse --branch rust-rewrite ap-cli --features ocr
@@ -139,6 +162,12 @@ phone. The agent must never type a passcode.
    ```sh
    agentphone setup ocr
    ```
+
+agentphone checks each model file against a pinned SHA-256 at download and at
+each load. If a file is missing or changed, OCR does not load. Run
+`agentphone setup ocr` again.
+
+OCR reads the full screenshot, without the grid.
 
 Without OCR, actions return only the image. `tap_on` returns an error that tells
 the agent to use `tap(x, y)`.

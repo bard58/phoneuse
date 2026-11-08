@@ -76,10 +76,12 @@ tools and images. The model must accept images.
    needs no key.
 
 Use `llm.provider openai` for all of these services, or the names
-`openrouter`, `ollama`, and `lmstudio`. Every provider other than `anthropic`
-reads the key from `OPENAI_API_KEY` (change the name with
-`llm.openai_api_key_env`). With `ollama` and `lmstudio`, a missing key is not
-an error.
+`openrouter`, `ollama`, and `lmstudio`. With these three names, an empty
+`llm.base_url` gives the address in the table above. Thus `ollama` and
+`lmstudio` use localhost by default, not `api.openai.com`. Every provider
+other than `anthropic` uses the OpenAI format and reads the key from
+`OPENAI_API_KEY` (change the name with `llm.openai_api_key_env`). With
+`ollama`, `lmstudio`, or a localhost address, a missing key is not an error.
 
 `agentphone setup llm` asks these questions for you.
 
@@ -113,23 +115,102 @@ For OpenAI-compatible and local models, agentphone shows tokens but no cost.
 Each step sends one downscaled screenshot. A long task costs more. To set a
 limit, use `--max-steps` or `safety.max_steps`.
 
+Limits of the estimate:
+
+- When Claude answers from a fallback model, agentphone counts the tokens of
+  all attempts. It uses the price of the model that gave the answer for all of
+  them.
+- If you stop the run while a model call runs, the provider can still bill
+  that call. agentphone does not know its tokens. The summary then says
+  "(+N cancelled call not counted; the cost is a lower bound)".
+
+### Time limits and retries
+
+- Each model request has a time limit of at least 600 seconds. For a large
+  `max_tokens`, the limit is longer.
+- agentphone does not send a request again after a time-out, because the
+  provider can bill the first request.
+- agentphone sends a request again after a connection failure, a rate limit
+  (429), or an overloaded server. It obeys the `retry-after` delay of the
+  server up to 60 seconds. For a longer delay, it stops.
+- agentphone does not retry an error for an empty quota or billing
+  (`insufficient_quota`, `billing_hard_limit_reached`, `billing_not_active`).
+
 ## Safety rules
 
-- **Confirmation before irreversible actions.** Before the agent sends, posts,
-  pays, buys, deletes, or changes an account, privacy, or security setting, it
-  asks you. You answer in the terminal. If you deny, agentphone does not do the
-  action. This is on by default (`safety.confirm_irreversible = true`).
-- **No passcode.** The agent never asks for, reads, or types a passcode, PIN,
-  password, or one-time code. If the phone is locked, the agent stops and asks
-  you to unlock it. `safety.allow_unlock` is off by default. When it is on,
-  the `agentphone run` terminal still does not enter a passcode: the agent asks
-  you to unlock the phone by hand.
-- **Take-over.** Push Ctrl+C at any time. The first Ctrl+C stops the agent, and
-  you have control of the phone. A second Ctrl+C exits at once.
-- **Step limit.** The run stops at `safety.max_steps` (default 50).
+These rules lower the risk. They do not remove it. Some rules depend on the
+AI model, and some depend on what is on the screen. Ctrl+C is the hard stop.
+
+### Confirmation
+
+This is on by default (`safety.confirm_irreversible = true`). You answer in
+the terminal. agentphone asks you before an action in these cases:
+
+- The model marks the action as irreversible. The model must do this before
+  it sends, posts, pays, buys, deletes, or changes an account, privacy, or
+  security setting.
+- The text to type contains a newline.
+- The key is Enter, with or without modifier keys.
+- The action is a tap, double tap, or long press right after typing, and the
+  open app is a messaging, payment, or shopping app. If agentphone cannot tell
+  which app is open, it also asks.
+
+agentphone itself makes the last three checks. They do not depend on the
+model.
+
+The question shows the next step, for example "Next step: tap at (0.900,
+0.900)". A yes allows only that one call. If the next call is a different
+action, agentphone refuses it and cancels the approval. A look, a wait, a
+question, or an unlock also cancels the approval.
+
+After you answer no, agentphone allows only Home and Back. This stays so until
+you answer a question from the agent, or approve a new confirmation.
 
 > CAUTION: Do not set `safety.confirm_irreversible` to `false`. The agent can
-> then send messages or buy items without a question.
+> then send messages or buy items without a question. The checks for Enter and
+> newlines also stop.
+
+### Passcodes
+
+- The agent never asks for, reads, or types a passcode, PIN, password, or
+  one-time code. If the phone is locked, the agent stops and asks you to
+  unlock it.
+- agentphone counts the digits that the agent types, with `type_text` and
+  with digit keys. At 4 digits or more, it refuses the action. Spaces, dashes,
+  and dots between the digits do not hide them. Full-width and other Unicode
+  digits also count. A tap between the digits does not reset the count.
+- To allow digits (for example a phone number), approve the exact call in the
+  terminal. agentphone asks this also when confirmations are off.
+- When the phone looks locked, agentphone refuses all text and keys. "Looks
+  locked" means that the screen text has a lock or passcode phrase, or that
+  an unlock did not end with "unlocked" or "not locked". The screen text needs
+  OCR. Without OCR, only the unlock result counts.
+- agentphone does not find a password that has letters, for example
+  `hunter2!`.
+- `safety.allow_unlock` is off by default. When it is on, the
+  `agentphone run` terminal still does not enter a passcode: the agent asks
+  you to unlock the phone by hand.
+- The step lines in the terminal hide digit text and digit keys. The model
+  sees the real values.
+
+### Take-over
+
+- Push Ctrl+C at any time. The first Ctrl+C stops the agent, and you have
+  control of the phone. A second Ctrl+C exits at once.
+- The first Ctrl+C stops the current action and the model call. `type_text`
+  stops before the next part of the text, and never pushes Enter after a
+  stop.
+- On an iPhone, the phone can complete a part of an action that it already
+  received. Each iPhone call has a time limit, so a stalled call cannot hold
+  the phone for good.
+
+### Other rules
+
+- If the screenshot after an action fails, the result is an error. agentphone
+  refuses the next action until a look succeeds.
+- On an iPhone, agentphone does not send input again after the phone got a
+  part of it. The result is then an "input may be partly delivered" error.
+- The run stops at `safety.max_steps` (default 50).
 
 ## Jev (optional)
 
@@ -148,16 +229,26 @@ Jev is off by default. Before each Jev call, agentphone finds the app on the
 screen and does not send the screenshot in these cases:
 
 - agentphone cannot tell which app is open. On Android, agentphone reads the
-  app from `dumpsys window`. On an iPhone, agentphone knows only the app that
-  the agent opened with `open_app`. After Home, the App Switcher, Lock, a swipe
-  from the bottom edge, or a Cmd shortcut, the app is unknown.
+  app from `dumpsys window`. When the notification shade or the lock screen
+  has the focus, the app is unknown. On an iPhone, agentphone knows the app
+  only right after it opens it with `open_app`. After any input (a tap, a
+  swipe, text, a key, or a button), the app is unknown. Thus on an iPhone,
+  Jev runs only on the first look after `open_app`.
 - The app id contains a word from the blocklist, for example `bank`, `paypal`,
   `wallet`, `messages`, `whatsapp`, `gmail`, `password`, `authenticator`,
   `photos`, or `health` (see `DEFAULT_BLOCKLIST` in
   `crates/ap-jev/src/privacy.rs`).
 
 The blocklist compares words with the app id. A banking app with an id that
-contains no blocklist word is sent. On an iPhone, a tap that opens a different
-app (a link, a share sheet) is not detected.
+contains no blocklist word is sent. The list also has real Android package
+ids, for example `com.google.android.gm` (Gmail), `org.thoughtcrime.securesms`
+(Signal), and `com.chase.sig.android` (Chase).
+
+On Android, the guard sees only the package id, not the app name. A word such
+as `gmail` can match an iOS bundle id, but not the Android id of Gmail. If you
+add an entry for an Android app, use its package id.
+
+The consent question needs a terminal. With no terminal (for example piped
+input), `--jev` stops with an error and does not ask.
 
 

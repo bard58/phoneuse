@@ -99,7 +99,31 @@ The table uses the check ids from `agentphone doctor --json`.
 When you use only an iPhone, the Android checks show as warnings. This is
 correct.
 
+On Windows, agentphone starts the adb server in the background through
+PowerShell. If this fails, the error tells you to run `adb start-server` one
+time in a terminal. Then try again. If the adb server stops later, agentphone
+starts it again at the next connection.
+
+For an IPv6 adb server address in `android.adb_host`, you can write the
+address with or without brackets, for example `[::1]` or `::1`.
+
 ### Coordinates
 
 agentphone uses fractions of the screen (0 to 1) for all positions. On
 Android, the screen size in points is the size in dp.
+
+agentphone reads the screen rotation when it opens the phone. In landscape,
+it swaps the width and the height. If the phone rotates later, agentphone
+uses the new size after the next screenshot.
+
+### Known limits
+
+- A swipe, a long press, or a drag lasts at most 30 seconds. agentphone
+  shortens a longer duration to 30 seconds.
+- Long text with ADBKeyBoard goes in parts of at most 2202 bytes. If a part
+  fails, the error tells how many characters are already typed.
+- Shift with a digit or a symbol gives the US-layout character, for example
+  Shift+1 gives `!`.
+- When the notification shade or the lock screen has the focus, the open app
+  is unknown. agentphone does not detect heads-up notifications.
+- Jev and the safety checks see the package id of the app, not its name.
