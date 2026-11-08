@@ -12,21 +12,45 @@ repository.workspace = true
 name = "agentphone"
 path = "src/main.rs"
 
+[features]
+default = []
+# On-device text recognition for `tap-on` (pure-Rust ocrs engine, models downloaded by `agentphone setup ocr`).
+ocr = ["ap-vision/ocr", "ap-mcp/ocr"]
+# Optional Jev screen judgments for `agentphone run --jev` (TypeSafe API, opt-in per run).
+jev = ["dep:ap-jev"]
+
 [dependencies]
 ap-core.workspace = true
 ap-ios.workspace = true
 ap-android.workspace = true
-ap-hid.workspace = true
 ap-screen.workspace = true
 ap-vision.workspace = true
 ap-llm.workspace = true
 ap-agent.workspace = true
 ap-mcp.workspace = true
+ap-jev = { workspace = true, optional = true }
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+# Terminal UI (console-rs family, versions checked on crates.io 2026-11-08).
+clap_complete = "4.6.11"
+dialoguer = { version = "0.12.0", default-features = false }
+indicatif = "0.18.6"
+console = "0.16.6"
+which = "8.0.6"
+
+[dev-dependencies]
+ap-core = { workspace = true, features = ["mock"] }
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true
