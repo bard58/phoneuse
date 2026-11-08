@@ -29,6 +29,27 @@ agentphone is early software. Read this before you use it.
 - Report problems in the issue tracker of
   [bard58/phoneuse](https://github.com/bard58/phoneuse/issues).
 
+## Install on Windows
+
+You do not need a Rust toolchain. In PowerShell, run this command:
+
+```powershell
+irm https://raw.githubusercontent.com/bard58/phoneuse/rust-rewrite/scripts/install.ps1 | iex
+```
+
+The script downloads `agentphone.exe` from the latest release. It puts the
+file in `%LOCALAPPDATA%\agentphone\bin` and adds that folder to your user
+`PATH`. It does not need admin rights. Then it checks for the Apple Devices
+app and runs `agentphone doctor`.
+
+Manual alternative:
+
+1. Download the Windows `.zip` file from the
+   [releases page](https://github.com/bard58/phoneuse/releases), or build
+   with `cargo` (see step 1 below).
+2. Put `agentphone.exe` in a folder that is on your `PATH`.
+3. Run `agentphone doctor`.
+
 ## Quick start (Windows)
 
 1. Get the binary. Download `agentphone.exe` from the
