@@ -50,6 +50,25 @@ fn input(q: &str, default: Option<&str>) -> String {
     i.interact_text().unwrap_or_default().trim().to_string()
 }
 
+/// Like [`input`], but `None` when the prompt fails (Ctrl+C, no terminal).
+fn required_input(q: &str, default: Option<&str>) -> Option<String> {
+    let t = theme();
+    let mut i = Input::<String>::with_theme(&t)
+        .with_prompt(q)
+        .allow_empty(true);
+    if let Some(d) = default {
+        i = i.default(d.to_string());
+    }
+    i.interact_text().ok().map(|s| s.trim().to_string())
+}
+
+/// The model to suggest for an OpenAI-compatible provider: the current one,
+/// unless it is a Claude id (an OpenAI-compatible server does not know it).
+pub fn openai_model_default(current: &str) -> Option<String> {
+    let m = current.trim();
+    (!m.is_empty() && !m.starts_with("claude-")).then(|| m.to_string())
+}
+
 fn say(text: &str) {
     for line in text.lines() {
         println!("  {line}");
@@ -209,10 +228,23 @@ pub fn ios_instructions(id: &str) -> Option<&'static str> {
     })
 }
 
+/// The iPhone to set up: `--device`, else the saved default iPhone.
+async fn ios_target(
+    cfg: &Config,
+    wanted: Option<&str>,
+) -> (Option<String>, Vec<ap_core::DeviceInfo>) {
+    let found = devices::discover(&[ios::provider(cfg)]).await.devices;
+    (ios::target(cfg, wanted, &found), found)
+}
+
 async fn ios_flow(cfg: &mut Config, wanted: Option<&str>) {
     step("iPhone");
+    let mut chosen;
     loop {
-        let checks = ios::checks(cfg, wanted).await;
+        let (udid, found) = ios_target(cfg, wanted).await;
+        chosen = udid;
+        let wanted = chosen.as_deref();
+        let checks = ios::checks(cfg, wanted, &found).await;
         show_checks(&checks);
         let Some(bad) = checks.iter().find(|c| c.status == Status::Fail) else {
             if checks.iter().any(|c| c.status == Status::Warn) {
@@ -223,7 +255,9 @@ async fn ios_flow(cfg: &mut Config, wanted: Option<&str>) {
             break;
         };
         println!();
-        match ios_instructions(&bad.id) {
+        // Several iPhones: the generic "connect by USB" text is wrong here.
+        let several = bad.id == "device" && wanted.is_none() && found.len() > 1;
+        match ios_instructions(&bad.id).filter(|_| !several) {
             Some(t) => say(t),
             None => say(&format!(
                 "{}: {}",
@@ -276,7 +310,7 @@ async fn ios_flow(cfg: &mut Config, wanted: Option<&str>) {
         "Also use the iPhone over Wi-Fi when the cable is unplugged? (same network)",
         false,
     ) {
-        match ios::save_wifi_pairing(cfg, wanted).await {
+        match ios::save_wifi_pairing(cfg, chosen.as_deref()).await {
             Ok(m) => ui::ok(m),
 
             Err(e) => ui::print_error(&e.into()),
@@ -429,7 +463,20 @@ async fn choose_default(cfg: &mut Config) {
         [] => ui::warn("no phone is connected right now; you can finish setup and connect later"),
         [one] => {
             ui::ok(format!("found {} ({})", one.name, one.platform));
-            cfg.default_device = None;
+            if let Some(saved) = cfg.default_device.clone().filter(|s| *s != one.id) {
+                // The saved phone may only be unplugged now: keep it unless asked.
+                if confirm(
+                    &format!(
+                        "The default phone {saved} is not connected now. Use {} by default instead?",
+                        one.name
+                    ),
+                    false,
+                ) {
+                    cfg.default_device = Some(one.id.clone());
+                } else {
+                    ui::ok(format!("{saved} stays the default phone"));
+                }
+            }
         }
         many => {
             let labels: Vec<String> = many
@@ -490,6 +537,7 @@ fn llm_flow(cfg: &mut Config) {
             }
         }
         Some(1) => {
+            let before = cfg.clone();
             cfg.llm.provider = "openai".into();
             let base = input(
                 "API address",
@@ -502,10 +550,24 @@ fn llm_flow(cfg: &mut Config) {
             );
             cfg.llm.base_url =
                 (!base.is_empty() && base != ap_llm::openai::DEFAULT_BASE_URL).then_some(base);
-            let cur = (!cfg.llm.model.starts_with("claude-")).then(|| cfg.llm.model.clone());
-            let model = input("Model name (must accept images)", cur.as_deref());
-            if !model.is_empty() {
-                cfg.llm.model = model;
+            let cur = openai_model_default(&cfg.llm.model);
+            // A Claude model id does not work with an OpenAI-compatible server,
+            // so the model name is required here.
+            loop {
+                match required_input("Model name (must accept images)", cur.as_deref()) {
+                    Some(m) if !m.is_empty() => {
+                        cfg.llm.model = m;
+                        break;
+                    }
+                    Some(_) => ui::warn(
+                        "enter the model name of your provider, for example the name shown by `ollama list`",
+                    ),
+                    None => {
+                        ui::warn("no model name given; run `agentphone setup llm` again later");
+                        *cfg = before;
+                        return;
+                    }
+                }
             }
         }
         _ => return,
@@ -670,6 +732,13 @@ mod tests {
                 .contains("Restart")
         );
         assert!(ios_instructions("x").is_none());
+    }
+
+    #[test]
+    fn openai_model_never_keeps_a_claude_id() {
+        assert_eq!(openai_model_default(ap_llm::models::CLAUDE_OPUS_5_5), None);
+        assert_eq!(openai_model_default(""), None);
+        assert_eq!(openai_model_default("llava").as_deref(), Some("llava"));
     }
 
     #[test]

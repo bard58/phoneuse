@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ap_core::{Config, DeviceProvider, Result};
+use ap_core::{Config, DeviceInfo, DeviceProvider, Platform, Result};
 use ap_ios::setup::{self, Progress, Status as IosStatus};
 
 use crate::doctor::{Check, Status};
@@ -51,9 +51,61 @@ pub fn convert(results: Vec<setup::CheckResult>) -> Vec<Check> {
         .collect()
 }
 
+/// The iPhone the checks and setup actions use: `--device`, else the saved
+/// default phone when discovery lists it as an iPhone (a saved Android
+/// default is not an iPhone id), else none (the only USB iPhone).
+pub fn target(cfg: &Config, wanted: Option<&str>, found: &[DeviceInfo]) -> Option<String> {
+    if let Some(w) = wanted {
+        return Some(w.to_string());
+    }
+    let d = cfg.default_device.as_deref()?;
+    found
+        .iter()
+        .any(|x| x.platform == Platform::Ios && x.id == d)
+        .then(|| d.to_string())
+}
+
 /// iPhone setup checks for `doctor` and the wizard, in setup order.
-pub async fn checks(cfg: &Config, udid: Option<&str>) -> Vec<Check> {
-    convert(setup::check(&cfg.ios, udid).await)
+/// `found` is the device discovery result (for Wi-Fi iPhones and the
+/// several-iPhones case).
+pub async fn checks(cfg: &Config, udid: Option<&str>, found: &[DeviceInfo]) -> Vec<Check> {
+    let mut v = convert(setup::check(&cfg.ios, udid).await);
+    adjust(&mut v, udid, found);
+    v
+}
+
+/// Fix the "iPhone connected" check with what discovery knows:
+/// - several iPhones and none chosen: say how to choose one;
+/// - no USB iPhone, but the iPhone works over Wi-Fi: a warning, not a failure.
+pub fn adjust(checks: &mut [Check], udid: Option<&str>, found: &[DeviceInfo]) {
+    let Some(c) = checks
+        .iter_mut()
+        .find(|c| c.id == "device" && c.status == Status::Fail)
+    else {
+        return;
+    };
+    let iphones: Vec<&DeviceInfo> = found
+        .iter()
+        .filter(|d| d.platform == Platform::Ios)
+        .filter(|d| udid.is_none_or(|u| d.id == u || d.id.starts_with(u)))
+        .collect();
+    if udid.is_none() && iphones.len() > 1 {
+        let ids: Vec<&str> = iphones.iter().map(|d| d.id.as_str()).collect();
+        c.fix = Some(format!(
+            "choose one with `agentphone use <id>` or pass `--device <id>` (ids: {})",
+            ids.join(", ")
+        ));
+    } else if let Some(d) = iphones.first() {
+        c.status = Status::Warn;
+        c.detail = format!(
+            "{} works over Wi-Fi, but it is not connected by USB, so the USB checks were skipped",
+            d.name
+        );
+        c.fix = Some(
+            "connect the USB cable to run all checks (needed again after each iPhone restart)"
+                .into(),
+        );
+    }
 }
 
 /// Pair with the iPhone (the phone shows "Trust This Computer?").
@@ -97,6 +149,78 @@ pub async fn save_wifi_pairing(cfg: &Config, udid: Option<&str>) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(id: &str, platform: Platform) -> DeviceInfo {
+        DeviceInfo {
+            id: id.into(),
+            name: format!("Phone {id}"),
+            platform,
+            os_version: "18.0".into(),
+            model: "iPhone14,5".into(),
+            screen_points: Default::default(),
+            screen_pixels: Default::default(),
+            backend: "hid".into(),
+        }
+    }
+
+    fn usb_fail(detail: &str) -> Vec<Check> {
+        vec![
+            Check::new(
+                "iPhone",
+                "usbmuxd",
+                "Apple Mobile Device service",
+                Status::Ok,
+                "",
+            ),
+            Check::new("iPhone", "device", "iPhone connected", Status::Fail, detail)
+                .with_fix("connect the iPhone with a USB cable"),
+        ]
+    }
+
+    #[test]
+    fn target_uses_saved_iphone_only() {
+        let found = [
+            info("IPHONE1", Platform::Ios),
+            info("R5CX", Platform::Android),
+        ];
+        let mut cfg = Config::default();
+        assert_eq!(target(&cfg, None, &found), None);
+        assert_eq!(target(&cfg, Some("X"), &found).as_deref(), Some("X"));
+        cfg.default_device = Some("IPHONE1".into());
+        assert_eq!(target(&cfg, None, &found).as_deref(), Some("IPHONE1"));
+        cfg.default_device = Some("R5CX".into());
+        assert_eq!(target(&cfg, None, &found), None);
+    }
+
+    #[test]
+    fn several_iphones_say_how_to_choose() {
+        let found = [info("A", Platform::Ios), info("B", Platform::Ios)];
+        let mut c = usb_fail("2 iPhones are connected; give a device id");
+        adjust(&mut c, None, &found);
+        assert_eq!(c[1].status, Status::Fail);
+        let fix = c[1].fix.as_deref().unwrap();
+        assert!(
+            fix.contains("agentphone use") && fix.contains("A, B"),
+            "{fix}"
+        );
+    }
+
+    #[test]
+    fn wifi_iphone_is_a_warning() {
+        let found = [info("A", Platform::Ios)];
+        let mut c = usb_fail("no iPhone is connected by USB");
+        adjust(&mut c, None, &found);
+        assert_eq!(c[1].status, Status::Warn);
+        assert!(c[1].detail.contains("Wi-Fi"));
+        // Another iPhone over Wi-Fi does not hide a missing chosen iPhone.
+        let mut c = usb_fail("iPhone Z is not connected by USB");
+        adjust(&mut c, Some("Z"), &found);
+        assert_eq!(c[1].status, Status::Fail);
+        // No iPhone at all: still a failure.
+        let mut c = usb_fail("no iPhone is connected by USB");
+        adjust(&mut c, None, &[info("R5CX", Platform::Android)]);
+        assert_eq!(c[1].status, Status::Fail);
+    }
 
     #[test]
     fn every_ios_check_has_a_name() {

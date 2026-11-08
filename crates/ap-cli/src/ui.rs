@@ -24,6 +24,13 @@ pub fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// "Press Enter to close this window", then wait for Enter.
+pub fn wait_for_enter() {
+    eprintln!("\nPress Enter to close this window.");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
 /// Print JSON (pretty) to stdout.
 pub fn json(v: &impl serde::Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);

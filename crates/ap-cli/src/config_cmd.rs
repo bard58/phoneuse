@@ -134,6 +134,11 @@ pub fn set_value(cfg: &Config, key: &str, raw: &str) -> Result<Config> {
                         .parse()
                         .with_context(|| format!("{key} needs a number, not \"{raw}\""))?,
                 ),
+                // A list cannot be "none": go back to the default list.
+                Value::Array(_) if clear => {
+                    table.remove(*last);
+                    return finish(root, key);
+                }
                 Value::Array(_) => Value::Array(
                     raw.split(',')
                         .map(str::trim)
@@ -245,6 +250,11 @@ mod tests {
         assert_eq!(c.default_device, None);
         let c = set_value(&c, "ios.backend_order", "hid, wda").unwrap();
         assert_eq!(c.ios.backend_order, vec!["hid", "wda"]);
+        let c = set_value(&c, "ios.backend_order", "none").unwrap();
+        assert_eq!(c.ios.backend_order, Config::default().ios.backend_order);
+        let c = set_value(&c, "ios.backend_order", "wda").unwrap();
+        let c = set_value(&c, "ios.backend_order", "").unwrap();
+        assert_eq!(c.ios.backend_order, Config::default().ios.backend_order);
         let c = set_value(&c, "android.adb_path", "D:\\Android\\platform-tools").unwrap();
         assert!(c.android.adb_path.is_some());
         assert_eq!(display_value(&c, "safety.max_steps").unwrap(), "12");

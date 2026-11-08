@@ -6,7 +6,9 @@
 //!
 //! Before each Jev call the observer asks the device for the foreground app
 //! (Android: `dumpsys window`; iOS: the app opened by the last `open_app`,
-//! else unknown) and gives it to the privacy guard. The guard does not send
+//! and only until the next input, else unknown) and gives it to the privacy
+//! guard. On an iPhone, Jev therefore runs only on the first look after
+//! `open_app`. The guard does not send
 //! the screen when the app is unknown or when its id matches the blocklist
 //! (`ap_jev::DEFAULT_BLOCKLIST`, substring match). A Jev error or refusal
 //! never stops the run.
@@ -17,7 +19,7 @@ use ap_core::{Device, Frame};
 use ap_jev::{JevClient, Privacy, PrivacyConfig, ScreenJudge, ScreenJudgment};
 
 /// The consent question. It states what the code does: see the module docs.
-pub const CONSENT_PROMPT: &str = "Jev sends a screenshot of your phone to typesafe.ai at each agent step. A screenshot is not sent when agentphone cannot tell which app is open, or when the app id contains a blocklist word (for example bank, wallet, messages, password, photos, health). Apps with other ids are sent. Allow for this run?";
+pub const CONSENT_PROMPT: &str = "Jev sends a screenshot of your phone to typesafe.ai at each agent step. A screenshot is not sent when agentphone cannot tell which app is open (on iPhone, agentphone knows the app only right after it opens it), or when the app id contains a blocklist word (for example bank, wallet, messages, password, photos, health). Apps with other ids are sent. Allow for this run?";
 
 pub struct JevObserver {
     inner: ScreenObserver,
@@ -91,20 +93,37 @@ impl Observer for JevObserver {
     }
 }
 
+/// Ask for consent. `can_ask` is false when there is no terminal to ask in.
+/// The question goes to stderr, so it also works with `--json`.
+pub fn consent(can_ask: bool, ask: impl FnOnce() -> bool) -> Result<()> {
+    if !can_ask {
+        anyhow::bail!(ap_core::Error::setup(
+            "--jev needs your consent, and agentphone can ask only in a terminal",
+            "run the command in a terminal and answer yes, or run it without --jev",
+        ));
+    }
+    if !ask() {
+        anyhow::bail!(ap_core::Error::setup(
+            "Jev was not allowed for this run",
+            "run again without --jev, or answer yes to the question",
+        ));
+    }
+    Ok(())
+}
+
 /// Build the observer after asking the user for consent.
-pub fn observer(json: bool) -> Result<Box<dyn Observer>> {
+pub fn observer() -> Result<Box<dyn Observer>> {
+    use std::io::IsTerminal;
     let client = JevClient::from_env()?;
     let privacy = Privacy::new(PrivacyConfig::default());
-    let agreed = !json
-        && crate::ui::interactive()
-        && dialoguer::Confirm::new()
+    let can_ask = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    consent(can_ask, || {
+        dialoguer::Confirm::new()
             .with_prompt(CONSENT_PROMPT)
             .default(false)
-            .interact()
-            .unwrap_or(false);
-    if !agreed {
-        anyhow::bail!("Jev was not allowed for this run. Run again without --jev, or answer yes");
-    }
+            .interact_on(&console::Term::stderr())
+            .unwrap_or(false)
+    })?;
     privacy.grant_consent();
     Ok(Box::new(JevObserver {
         inner: ScreenObserver::default(),
@@ -152,6 +171,17 @@ mod tests {
         assert!(PrivacyConfig::default().block_unknown_app);
         assert!(!CONSENT_PROMPT.contains("never sent"));
         assert!(CONSENT_PROMPT.contains("cannot tell which app"));
+    }
+
+    #[test]
+    fn consent_rules() {
+        // No terminal (for example piped stdin): a clear error, no question.
+        let e = consent(false, || panic!("must not ask")).unwrap_err();
+        let (problem, fix) = crate::ui::explain(&e);
+        assert!(problem.contains("terminal"), "{problem}");
+        assert!(fix.unwrap().contains("without --jev"));
+        assert!(consent(true, || false).is_err());
+        assert!(consent(true, || true).is_ok());
     }
 
     #[test]

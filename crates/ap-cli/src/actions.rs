@@ -42,13 +42,22 @@ pub fn to_point(x: f32, y: f32, px: bool, pixels: Size) -> Result<Point> {
     Ok(p)
 }
 
-/// Screenshot pixel size, from the device info or a fresh screenshot.
+/// Screenshot pixel size, from a fresh screenshot. `--px` means pixels of
+/// the saved screenshot, and the device info size can be a guess (for
+/// example an unknown iPad model). The device info is the fallback when the
+/// phone cannot take a screenshot.
 pub async fn pixel_size(d: &dyn Device) -> Result<Size> {
-    let s = d.info().screen_pixels;
-    if !s.is_empty() {
-        return Ok(s);
+    match d.screenshot().await {
+        Ok(f) if !f.size().is_empty() => Ok(f.size()),
+        Ok(_) => Ok(d.info().screen_pixels),
+        Err(e) => {
+            let s = d.info().screen_pixels;
+            if s.is_empty() {
+                return Err(e.into());
+            }
+            Ok(s)
+        }
     }
-    Ok(d.screenshot().await?.size())
 }
 
 pub async fn point(d: &dyn Device, x: f32, y: f32, px: bool) -> Result<Point> {
@@ -138,7 +147,18 @@ pub async fn tap(d: &dyn Device, at: Point, double: bool, json: bool) -> Result<
 
 pub async fn tap_on(d: &dyn Device, text: &str, exact: bool, json: bool) -> Result<()> {
     let recognizer = ap_vision::default_recognizer()?;
-    let frame = d.screenshot().await?;
+    // Read a settled screen: text read during an animation can move before
+    // the tap lands. Try twice, then stop without tapping.
+    let mut settled = ap_screen::settle_with(d, ap_screen::SettleConfig::default()).await?;
+    if !settled.still {
+        settled = ap_screen::settle_with(d, ap_screen::SettleConfig::default()).await?;
+    }
+    if !settled.still {
+        bail!(
+            "the screen is still changing, so the text position is not sure. Wait, then run tap-on again"
+        );
+    }
+    let frame = settled.frame;
     let boxes = recognizer.recognize(&frame)?;
     let lines = ap_vision::screen_lines(&boxes, false);
     let opts = ap_vision::FindOptions {
@@ -386,6 +406,19 @@ mod tests {
         );
         assert!(matches!(&calls[7], Gesture::LaunchApp { id } if id == "com.apple.Preferences"));
         assert!(matches!(&calls[8], Gesture::LaunchApp { id } if id == "com.apple.mobilesafari"));
+    }
+
+    #[tokio::test]
+    async fn px_uses_the_screenshot_size() {
+        let m = MockDevice::new();
+        let d: &dyn Device = &m;
+        let before = m.screenshot_count();
+        let p = point(d, 585.0, 1266.0, true).await.unwrap();
+        assert!((p.x - 0.5).abs() < 1e-6 && (p.y - 0.5).abs() < 1e-6);
+        assert_eq!(m.screenshot_count(), before + 1);
+        // Fractions need no screenshot.
+        point(d, 0.5, 0.5, false).await.unwrap();
+        assert_eq!(m.screenshot_count(), before + 1);
     }
 
     #[tokio::test]

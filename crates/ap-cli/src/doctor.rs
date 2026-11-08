@@ -145,26 +145,33 @@ pub fn config_checks(cfg_path: &Path, cfg: Result<&Config, &anyhow::Error>) -> V
     }
     if let Ok(cfg) = cfg {
         let llm = &cfg.llm;
-        let known = matches!(
-            llm.provider.to_ascii_lowercase().as_str(),
-            "anthropic"
-                | "claude"
-                | "openai"
-                | "openai-compatible"
-                | "openrouter"
-                | "ollama"
-                | "lmstudio"
-        );
-        if !known {
+        // Same rule as `ap_llm::provider_from_config`: any non-empty name;
+        // every name but Anthropic's uses the OpenAI wire format.
+        if llm.provider.trim().is_empty() {
             v.push(
                 Check::new(
                     "AI model",
                     "llm_provider",
                     "Provider",
                     Status::Fail,
-                    format!("unknown provider \"{}\"", llm.provider),
+                    "no provider is set".to_string(),
                 )
                 .with_fix("run `agentphone config set llm.provider anthropic` (or openai)"),
+            );
+        } else if !llm.is_anthropic() && llm.model.starts_with("claude-") {
+            // An OpenAI-compatible server does not know Anthropic model ids.
+            v.push(
+                Check::new(
+                    "AI model",
+                    "llm_provider",
+                    "Provider",
+                    Status::Warn,
+                    format!(
+                        "{} / {}: this is a Claude model id, but the provider is not Anthropic",
+                        llm.provider, llm.model
+                    ),
+                )
+                .with_fix("run `agentphone setup llm` and enter the model name of your provider"),
             );
         } else {
             v.push(Check::new(
@@ -176,13 +183,21 @@ pub fn config_checks(cfg_path: &Path, cfg: Result<&Config, &anyhow::Error>) -> V
             ));
         }
         let var = llm.api_key_env();
-        if llm.api_key().is_ok() {
+        if std::env::var(var).is_ok_and(|k| !k.trim().is_empty()) {
             v.push(Check::new(
                 "AI model",
                 "llm_key",
                 "API key",
                 Status::Ok,
                 format!("{var} is set"),
+            ));
+        } else if !ap_llm::key_required(llm) {
+            v.push(Check::new(
+                "AI model",
+                "llm_key",
+                "API key",
+                Status::Ok,
+                "local server, no key needed",
             ));
         } else {
             // Only `agentphone run` needs a key; MCP clients bring their own model.
@@ -281,6 +296,9 @@ pub async fn android_checks(cfg: &Config) -> Vec<Check> {
     v
 }
 
+/// The install command for a build with OCR (the same as in docs/mcp.md).
+pub const OCR_INSTALL: &str = "cargo install --git https://github.com/bard58/phoneuse --branch rust-rewrite ap-cli --features ocr";
+
 /// OCR (tap-on) check.
 pub fn ocr_checks() -> Vec<Check> {
     let g = "Text recognition";
@@ -293,7 +311,7 @@ pub fn ocr_checks() -> Vec<Check> {
                 Status::Warn,
                 "not in this build (optional)",
             )
-            .with_fix("build with `cargo install --path crates/ap-cli --features ocr`"),
+            .with_fix(format!("install a build with OCR: `{OCR_INSTALL}`")),
         ];
     }
     match ap_vision::default_recognizer() {
@@ -305,14 +323,8 @@ pub fn ocr_checks() -> Vec<Check> {
             r.name().to_string(),
         )],
         Err(e) => vec![
-            Check::new(
-                g,
-                "ocr",
-                "OCR for tap-on",
-                Status::Warn,
-                "models not downloaded",
-            )
-            .with_fix(e.hint().unwrap_or("run `agentphone setup ocr`").to_string()),
+            Check::new(g, "ocr", "OCR for tap-on", Status::Warn, e.to_string())
+                .with_fix(e.hint().unwrap_or("run `agentphone setup ocr`").to_string()),
         ],
     }
 }
@@ -322,9 +334,10 @@ pub async fn gather(cfg_path: &Path, wanted: Option<&str>) -> Vec<Check> {
     let loaded = crate::config_cmd::load(cfg_path);
     let mut checks = config_checks(cfg_path, loaded.as_ref());
     let cfg = loaded.unwrap_or_default();
-    checks.extend(ios::checks(&cfg, wanted).await);
-    checks.extend(android_checks(&cfg).await);
     let found = devices::discover(&devices::providers(&cfg)).await;
+    let iphone = ios::target(&cfg, wanted, &found.devices);
+    checks.extend(ios::checks(&cfg, iphone.as_deref(), &found.devices).await);
+    checks.extend(android_checks(&cfg).await);
     let g = "Phones";
     if found.devices.is_empty() {
         checks.push(
@@ -521,8 +534,48 @@ Android
                 .unwrap()
                 .contains("AGENTPHONE_TEST_SURELY_UNSET_KEY")
         );
-        cfg.llm.provider = "foo".into();
+        // Same rule as `ap_llm::provider_from_config`: only an empty name fails.
+        cfg.llm.provider = "  ".into();
         let checks = config_checks(Path::new("x"), Ok(&cfg));
         assert!(any_failed(&checks));
+        cfg.llm.provider = "groq".into();
+        let checks = config_checks(Path::new("x"), Ok(&cfg));
+        let p = checks.iter().find(|c| c.id == "llm_provider").unwrap();
+        assert_ne!(p.status, Status::Fail, "{p:?}");
+    }
+
+    #[test]
+    fn local_server_needs_no_key() {
+        let mut cfg = Config::default();
+        cfg.llm.provider = "openai".into();
+        cfg.llm.model = "llava".into();
+        cfg.llm.openai_api_key_env = "AGENTPHONE_TEST_SURELY_UNSET_KEY".into();
+        cfg.llm.base_url = Some("http://localhost:11434/v1".into());
+        let checks = config_checks(Path::new("x"), Ok(&cfg));
+        let key = checks.iter().find(|c| c.id == "llm_key").unwrap();
+        assert_eq!(key.status, Status::Ok, "{key:?}");
+        cfg.llm.base_url = None;
+        let checks = config_checks(Path::new("x"), Ok(&cfg));
+        let key = checks.iter().find(|c| c.id == "llm_key").unwrap();
+        assert_eq!(key.status, Status::Warn);
+    }
+
+    #[test]
+    fn claude_model_with_openai_is_a_warning() {
+        let mut cfg = Config::default();
+        cfg.llm.provider = "openai".into();
+        let checks = config_checks(Path::new("x"), Ok(&cfg));
+        let p = checks.iter().find(|c| c.id == "llm_provider").unwrap();
+        assert_eq!(p.status, Status::Warn);
+        assert!(p.fix.as_deref().unwrap().contains("setup llm"));
+    }
+
+    #[test]
+    fn ocr_fix_works_without_a_checkout() {
+        assert!(OCR_INSTALL.contains("--git") && !OCR_INSTALL.contains("--path"));
+        if !ap_vision::OCR_ENABLED {
+            let c = &ocr_checks()[0];
+            assert!(c.fix.as_deref().unwrap().contains(OCR_INSTALL));
+        }
     }
 }

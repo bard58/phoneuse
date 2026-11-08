@@ -8,7 +8,8 @@ const COORDS_HELP: &str = "\
 COORDINATES:
   X and Y are fractions of the screen from the top-left corner:
   0 0 is the top-left corner, 0.5 0.5 is the centre, 1 1 is the bottom-right corner.
-  Add --px to give screenshot pixels instead (as in `agentphone screenshot --grid`).";
+  The grid from `agentphone screenshot --grid` shows these fractions.
+  Add --px to give pixel positions in the saved screenshot instead.";
 
 /// Let an AI agent use your phone (iPhone with iOS 17.4+, or Android).
 #[derive(Debug, Parser)]
@@ -91,8 +92,8 @@ pub enum Command {
     LongPress {
         #[command(flatten)]
         at: PointArgs,
-        /// Hold time in milliseconds.
-        #[arg(long, default_value_t = 800)]
+        /// Hold time in milliseconds (1 to 30000).
+        #[arg(long, default_value_t = 800, value_parser = clap::value_parser!(u64).range(1..=30000))]
         ms: u64,
     },
     /// Swipe from one point to another.
@@ -102,8 +103,8 @@ pub enum Command {
         y1: f32,
         x2: f32,
         y2: f32,
-        /// Duration in milliseconds.
-        #[arg(long, default_value_t = 300)]
+        /// Duration in milliseconds (1 to 30000).
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=30000))]
         ms: u64,
         /// The numbers are screenshot pixels, not fractions.
         #[arg(long)]
@@ -249,7 +250,7 @@ pub enum ConfigAction {
     Path,
     /// Change one value, e.g. `config set llm.model claude-sonnet-5-5`.
     #[command(
-        after_help = "Use `none` to clear an optional value, e.g. `config set default_device none`.\nAPI keys are never stored here: set them as environment variables."
+        after_help = "Use `none` to clear an optional value, e.g. `config set default_device none`.\nFor a list (e.g. ios.backend_order), `none` restores the default list.\nAPI keys are never stored here: set them as environment variables."
     )]
     Set { key: String, value: String },
     /// Open the config file in a text editor.

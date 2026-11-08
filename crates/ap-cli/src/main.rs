@@ -66,7 +66,22 @@ async fn execute(cli: Cli) -> Result<u8> {
 
     let Some(command) = cli.command else {
         if !cfg_path.exists() && ui::interactive() {
-            setup::run(&cfg_path, None, wanted).await?;
+            let r = setup::run(&cfg_path, None, wanted).await;
+            if cfg!(windows) {
+                // A double-click on agentphone.exe opens a console window that
+                // closes when the program ends. Keep it open so the user can
+                // read the last steps (or the error).
+                let code = match &r {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        ui::print_error(e);
+                        1
+                    }
+                };
+                ui::wait_for_enter();
+                return Ok(code);
+            }
+            r?;
         } else {
             Cli::command().print_help()?;
             println!();
@@ -153,8 +168,14 @@ async fn device_command(d: &dyn ap_core::Device, command: Command, json: bool) -
             ms,
             px,
         } => {
-            let from = a::point(d, x1, y1, px).await?;
-            let to = a::point(d, x2, y2, px).await?;
+            // One screenshot size for both points.
+            let size = if px {
+                a::pixel_size(d).await?
+            } else {
+                ap_core::Size::default()
+            };
+            let from = a::to_point(x1, y1, px, size)?;
+            let to = a::to_point(x2, y2, px, size)?;
             a::swipe(d, from, to, ms, json).await
         }
         Command::Scroll {

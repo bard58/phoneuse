@@ -14,8 +14,9 @@ use console::style;
 
 use crate::cli::RunArgs;
 
-/// What the CLI host answers to `unlock`.
-pub const UNLOCK_BY_HAND: &str = "agentphone does not enter passcodes. Call `ask_user` to ask the owner to unlock the phone by hand, then look at the screen again.";
+/// What the CLI host answers to `unlock`. It matches the system prompt:
+/// when `unlock` does not answer "unlocked", the agent stops with `done`.
+pub const UNLOCK_BY_HAND: &str = "agentphone run does not enter passcodes. Call `done` with success=false and ask the owner to unlock the phone by hand, then run the task again.";
 
 /// Answers the agent's questions. Prompts run on a blocking thread.
 pub trait Prompter: Send + Sync + 'static {
@@ -208,15 +209,41 @@ pub fn options(cfg: &Config, args: &RunArgs) -> AgentOptions {
 }
 
 /// The LLM config with `--provider` / `--model` applied.
-pub fn llm_config(cfg: &Config, args: &RunArgs) -> ap_core::LlmConfig {
+///
+/// A `--provider` that changes the provider family (Anthropic or
+/// OpenAI-compatible) needs `--model` too: the configured model id belongs to
+/// the other family (for example `claude-opus-5-5` sent to OpenAI).
+pub fn llm_config(cfg: &Config, args: &RunArgs) -> Result<ap_core::LlmConfig> {
     let mut l = cfg.llm.clone();
     if let Some(p) = &args.provider {
         l.provider = p.clone();
+        if args.model.is_none() && l.is_anthropic() != cfg.llm.is_anthropic() {
+            return Err(ap_core::Error::setup(
+                format!(
+                    "--provider {p} needs --model: the configured model \"{}\" is for provider \"{}\"",
+                    cfg.llm.model, cfg.llm.provider
+                ),
+                format!("add `--model <model id>` for {p}, or run `agentphone setup llm`"),
+            )
+            .into());
+        }
     }
     if let Some(m) = &args.model {
         l.model = m.clone();
     }
-    l
+    Ok(l)
+}
+
+/// The final `run --json` line. Every stdout line in JSON mode is one JSON
+/// object (JSONL): the events have an `event` field, and this last line has
+/// `"event": "report"`.
+pub fn report_line(report: &RunReport) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "event": "report",
+        "outcome": report.outcome,
+        "steps": report.steps,
+        "usage": report.usage,
+    }))?)
 }
 
 /// Final summary text.
@@ -324,26 +351,24 @@ pub async fn ctrl_c() {
 
 /// `agentphone run`.
 pub async fn command(cfg: &Config, args: &RunArgs, wanted: Option<&str>, json: bool) -> Result<u8> {
-    let llm = llm_config(cfg, args);
+    let llm = llm_config(cfg, args)?;
     let provider = ap_llm::provider_from_config(&llm)?;
-    let device = crate::devices::connect(cfg, wanted).await?;
-    let opts = options(cfg, args);
-    let host: Arc<dyn AgentHost> = Arc::new(TerminalHost::new(TerminalPrompter, json));
 
+    // Ask for Jev consent before the phone connection is opened.
     #[allow(unused_mut)]
     let mut observer: Option<Box<dyn ap_agent::Observer>> = None;
     #[cfg(feature = "jev")]
     if args.jev {
-        observer = Some(crate::jev::observer(json)?);
+        observer = Some(crate::jev::observer()?);
     }
+
+    let device = crate::devices::connect(cfg, wanted).await?;
+    let opts = options(cfg, args);
+    let host: Arc<dyn AgentHost> = Arc::new(TerminalHost::new(TerminalPrompter, json));
 
     let report = run_agent(provider, device, host, opts, observer, &args.task, ctrl_c()).await;
     if json {
-        crate::ui::json(&serde_json::json!({
-            "outcome": report.outcome,
-            "steps": report.steps,
-            "usage": report.usage,
-        }))?;
+        println!("{}", report_line(&report)?);
     } else {
         eprintln!("\n{}", summary(&report));
     }
@@ -504,7 +529,9 @@ mod tests {
         let m = mock();
         match host.unlock(&m).await {
             UnlockResult::Unavailable(why) => {
-                assert!(why.contains("by hand") && why.contains("ask_user"))
+                // Same rule as the system prompt: stop with `done`, no `ask_user`.
+                assert!(why.contains("by hand") && why.contains("`done`"));
+                assert!(!why.contains("ask_user"));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -514,7 +541,10 @@ mod tests {
     async fn denied_confirmation_blocks_action() {
         let (r, m, lines) = run_script(
             vec![
-                call("confirm", json!({"action": "Send the message"})),
+                call(
+                    "confirm",
+                    json!({"action": "Send the message", "tool": "tap", "input": {"x": 0.9, "y": 0.9}}),
+                ),
                 call("tap", json!({"x": 0.9, "y": 0.9, "irreversible": true})),
                 call("done", json!({"summary": "not sent", "success": false})),
             ],
@@ -562,10 +592,63 @@ mod tests {
         assert_eq!(o.max_steps, 1);
         assert_eq!(o.model.as_deref(), Some("claude-haiku-5-5"));
         assert!(o.confirm_irreversible);
-        let l = llm_config(&cfg, &args);
+        let l = llm_config(&cfg, &args).unwrap();
         assert_eq!(
             (l.provider.as_str(), l.model.as_str()),
             ("openai", "claude-haiku-5-5")
         );
+    }
+
+    fn run_args(provider: Option<&str>, model: Option<&str>) -> RunArgs {
+        RunArgs {
+            task: "x".into(),
+            max_steps: None,
+            model: model.map(Into::into),
+            provider: provider.map(Into::into),
+            #[cfg(feature = "jev")]
+            jev: false,
+        }
+    }
+
+    #[test]
+    fn provider_switch_needs_a_model() {
+        // Default config: anthropic / claude-opus-5-5.
+        let cfg = Config::default();
+        let e = llm_config(&cfg, &run_args(Some("openai"), None)).unwrap_err();
+        let (problem, fix) = crate::ui::explain(&e);
+        assert!(problem.contains("--model"), "{problem}");
+        assert!(fix.unwrap().contains("--model"));
+        // Same family: no model needed.
+        let l = llm_config(&cfg, &run_args(Some("claude"), None)).unwrap();
+        assert_eq!(l.model, "claude-opus-5-5");
+        // OpenAI-compatible config, one run with Anthropic.
+        let mut o = Config::default();
+        o.llm.provider = "ollama".into();
+        o.llm.model = "llava".into();
+        assert!(llm_config(&o, &run_args(Some("anthropic"), None)).is_err());
+        assert!(llm_config(&o, &run_args(Some("openrouter"), None)).is_ok());
+        let l = llm_config(&o, &run_args(Some("anthropic"), Some("claude-haiku-5-5"))).unwrap();
+        assert_eq!(
+            (l.provider.as_str(), l.model.as_str()),
+            ("anthropic", "claude-haiku-5-5")
+        );
+    }
+
+    #[test]
+    fn json_report_is_one_line() {
+        let r = RunReport {
+            outcome: Outcome::Done {
+                summary: "ok".into(),
+                success: true,
+            },
+            steps: 2,
+            usage: Default::default(),
+            transcript: Vec::new(),
+        };
+        let line = report_line(&r).unwrap();
+        assert!(!line.contains('\n'), "{line}");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "report");
+        assert_eq!(v["steps"], 2);
     }
 }
