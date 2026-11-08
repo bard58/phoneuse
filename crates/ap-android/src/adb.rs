@@ -5,7 +5,9 @@
 //! or `FAIL<4 hex length><message>`. Host services (`host:devices-l`,
 //! `host:connect:...`) answer `OKAY<4 hex length><data>`. Device services
 //! first switch the socket with `host:transport:<serial>`, then send
-//! `exec:<command>`, which streams raw stdout (binary safe, no PTY) until EOF.
+//! `exec:<command>`, which streams the command's output (binary safe, no PTY)
+//! until EOF. `exec:` has no shell protocol, so stdout and stderr arrive merged
+//! on one stream: redirect stderr (`2>/dev/null`) when the output must be clean.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,7 +24,8 @@ use crate::locate::{self, locate_adb};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Time allowed for a host service reply.
 const HOST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Time allowed for one device command (uiautomator dump can be slow).
+/// Time allowed for one device command (uiautomator dump can be slow). It must
+/// stay well above the longest gesture ([`crate::parse::MAX_GESTURE_MS`]).
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Time allowed for `adb start-server`.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,21 +37,25 @@ pub trait Transport: Send + Sync {
     /// and return its length-prefixed reply. The `host:` prefix is added here.
     async fn host(&self, service: &str) -> Result<String>;
 
-    /// Run a shell command on the device (`exec:` service) and return stdout.
+    /// Run a shell command on the device (`exec:` service) and return its
+    /// output. stdout and stderr are merged on one stream.
     async fn exec(&self, serial: &str, command: &str) -> Result<Vec<u8>>;
 }
 
-/// Connection to an adb server. Starts a local server on first use if needed.
+/// Connection to an adb server. Starts a local server when it does not answer
+/// (also later, if the server stops while this process runs).
 pub struct AdbServer {
     config: AndroidConfig,
-    started: Mutex<bool>,
+    /// Serializes start attempts. It holds no state, so a server that stops
+    /// later is started again.
+    start_lock: Mutex<()>,
 }
 
 impl AdbServer {
     pub fn new(config: AndroidConfig) -> Self {
         Self {
             config,
-            started: Mutex::new(false),
+            start_lock: Mutex::new(()),
         }
     }
 
@@ -56,12 +63,21 @@ impl AdbServer {
         &self.config
     }
 
+    /// Configured host without IPv6 brackets (`[::1]` -> `::1`).
+    fn host_name(&self) -> &str {
+        let h = self.config.adb_host.trim();
+        h.strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .unwrap_or(h)
+    }
+
     /// `host:port` of the server.
     pub fn address(&self) -> String {
-        if self.config.adb_host.contains(':') {
-            format!("[{}]:{}", self.config.adb_host, self.config.adb_port)
+        let h = self.host_name();
+        if h.contains(':') {
+            format!("[{h}]:{}", self.config.adb_port)
         } else {
-            format!("{}:{}", self.config.adb_host, self.config.adb_port)
+            format!("{h}:{}", self.config.adb_port)
         }
     }
 
@@ -81,7 +97,7 @@ impl AdbServer {
         match self.try_connect().await {
             Ok(s) => Ok(s),
             Err(first) => {
-                if !locate::is_loopback(&self.config.adb_host) {
+                if !locate::is_loopback(self.host_name()) {
                     return Err(Error::setup(
                         format!("cannot reach the adb server at {}: {first}", self.address()),
                         "start adb on that host (`adb -a nodaemon server start`) or set \
@@ -101,7 +117,7 @@ impl AdbServer {
     }
 
     async fn try_connect(&self) -> std::io::Result<TcpStream> {
-        let addr = (self.config.adb_host.as_str(), self.config.adb_port);
+        let addr = (self.host_name(), self.config.adb_port);
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(r) => r,
             Err(_) => Err(std::io::Error::new(
@@ -111,26 +127,30 @@ impl AdbServer {
         }
     }
 
-    /// Start the local adb server once per process, then wait until it answers.
+    /// Start the local adb server, then wait until it answers. Concurrent
+    /// callers wait for one attempt; a caller that finds the server already
+    /// answering returns at once.
     async fn start_server(&self) -> Result<()> {
-        let mut started = self.started.lock().await;
-        if *started {
+        let _guard = self.start_lock.lock().await;
+        if self.try_connect().await.is_ok() {
             return Ok(());
         }
         let adb = self.adb_path()?;
         tracing::info!(adb = %adb.display(), "starting adb server");
+        // Windows: no direct-spawn fallback. A direct child lets the long-lived
+        // daemon inherit our stdio pipes (see launch_detached_windows).
         #[cfg(windows)]
-        let detached = self.launch_detached_windows(&adb).await;
+        self.launch_detached_windows(&adb).await.map_err(|e| {
+            Error::setup(
+                format!("could not start the adb server in the background: {e}"),
+                "run `adb start-server` once in a terminal, then retry",
+            )
+        })?;
         #[cfg(not(windows))]
-        let detached: Result<()> = Err(Error::unsupported("detached launch"));
-        if let Err(e) = detached {
-            tracing::debug!("detached adb launch unavailable ({e}); running adb directly");
-            self.launch_direct(&adb).await?;
-        }
+        self.launch_direct(&adb).await?;
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
             if self.try_connect().await.is_ok() {
-                *started = true;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -172,6 +192,7 @@ impl AdbServer {
     }
 
     /// Run `adb -P <port> start-server` as a child and wait for it.
+    #[cfg(not(windows))]
     async fn launch_direct(&self, adb: &std::path::Path) -> Result<()> {
         let mut cmd = tokio::process::Command::new(adb);
         cmd.arg("-P")
@@ -181,11 +202,6 @@ impl AdbServer {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(false);
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
         let status = tokio::time::timeout(START_TIMEOUT, cmd.status())
             .await
             .map_err(|_| Error::Timeout(START_TIMEOUT))?
@@ -404,5 +420,50 @@ mod tests {
     fn address_format() {
         let s = AdbServer::new(AndroidConfig::default());
         assert_eq!(s.address(), "127.0.0.1:5037");
+        for host in ["[::1]", "::1", " [::1] "] {
+            let s = AdbServer::new(AndroidConfig {
+                adb_host: host.into(),
+                ..AndroidConfig::default()
+            });
+            assert_eq!(s.address(), "[::1]:5037", "{host:?}");
+            assert_eq!(s.host_name(), "::1");
+        }
+    }
+
+    /// Config for a server on `port` whose adb binary does not exist, so any
+    /// launch attempt fails with a recognizable error.
+    fn missing_adb(port: u16) -> AndroidConfig {
+        AndroidConfig {
+            adb_path: Some(std::env::temp_dir().join("agentphone-no-such-adb.exe")),
+            adb_host: "127.0.0.1".into(),
+            adb_port: port,
+        }
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_host_connects() {
+        let Ok(l) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback on this machine
+        };
+        let s = AdbServer::new(AndroidConfig {
+            adb_host: "[::1]".into(),
+            ..missing_adb(l.local_addr().unwrap().port())
+        });
+        assert!(s.try_connect().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_is_started_again_after_it_stops() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s = AdbServer::new(missing_adb(port));
+        // Server answers: no launch needed.
+        s.start_server().await.unwrap();
+        s.open().await.unwrap();
+        // Server stops: the next open must try to launch adb again (and fail
+        // here on the missing binary) instead of trusting an old "started" flag.
+        drop(l);
+        let e = s.open().await.unwrap_err().to_string();
+        assert!(e.contains("does not exist"), "{e}");
     }
 }

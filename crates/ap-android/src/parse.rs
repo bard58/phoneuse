@@ -125,14 +125,31 @@ pub struct Props {
     pub model: String,
     pub release: String,
     pub sdk: u32,
+    /// Size from `wm size`, in the natural (unrotated) orientation.
     pub pixels: Option<(u32, u32)>,
     pub dpi: Option<u32>,
+    /// Current display rotation, 0..=3 (quarter turns). 0 if unknown.
+    pub rotation: u32,
 }
 
-/// One round trip for model, version, size and density.
+impl Props {
+    /// Screen size in the current orientation: `wm size` reports the natural
+    /// orientation, but `input` and `screencap` use the rotated one.
+    pub fn rotated_pixels(&self) -> Option<(u32, u32)> {
+        self.pixels.map(|(w, h)| {
+            if self.rotation % 2 == 1 {
+                (h, w)
+            } else {
+                (w, h)
+            }
+        })
+    }
+}
+
+/// One round trip for model, version, size, density and rotation.
 pub const INFO_SCRIPT: &str = "getprop ro.product.manufacturer; getprop ro.product.model; \
      getprop ro.build.version.release; getprop ro.build.version.sdk; echo @@AP@@; \
-     wm size 2>&1; echo @@AP@@; wm density 2>&1";
+     wm size 2>&1; echo @@AP@@; wm density 2>&1; echo @@AP@@; dumpsys input 2>/dev/null | grep -m1 -E 'SurfaceOrientation|Viewport INTERNAL'; dumpsys window displays 2>/dev/null | grep -m1 -E 'mCurrentRotation=|mRotation='";
 
 /// Parse the output of [`INFO_SCRIPT`].
 pub fn parse_info(text: &str) -> Props {
@@ -147,7 +164,39 @@ pub fn parse_info(text: &str) -> Props {
         sdk: get(3).parse().unwrap_or(0),
         pixels: parse_wm_size(parts.next().unwrap_or("")),
         dpi: parse_wm_density(parts.next().unwrap_or("")),
+        rotation: parse_rotation(parts.next().unwrap_or("")),
     }
+}
+
+/// Current rotation (0..=3) from the last part of [`INFO_SCRIPT`]: `dumpsys
+/// input` (`SurfaceOrientation: 1`, or `orientation=1` on a viewport line) or
+/// `dumpsys window displays` (`mRotation=1`, `mCurrentRotation=ROTATION_90`).
+/// The first value found wins; 0 if none.
+pub fn parse_rotation(text: &str) -> u32 {
+    fn value(v: &str) -> Option<u32> {
+        let v = v.trim_start();
+        let v = v.strip_prefix("ROTATION_").unwrap_or(v);
+        let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
+        match digits.parse::<u32>().ok()? {
+            n @ 0..=3 => Some(n),
+            90 => Some(1),
+            180 => Some(2),
+            270 => Some(3),
+            _ => None,
+        }
+    }
+    text.lines()
+        .find_map(|line| {
+            [
+                "SurfaceOrientation:",
+                "mCurrentRotation=",
+                "mRotation=",
+                " orientation=",
+            ]
+            .iter()
+            .find_map(|k| value(line.split_once(k)?.1))
+        })
+        .unwrap_or(0)
 }
 
 /// "Google Pixel 8", without repeating the maker ("samsung SM-S911B").
@@ -168,9 +217,13 @@ pub fn to_px(p: Point, pixels: Size) -> (u32, u32) {
     p.to_pixels(pixels)
 }
 
-/// Duration for `input swipe`, in ms (1..=60000).
+/// Longest gesture, in ms. Kept well below the 60 s adb exec timeout, which
+/// must also cover the `input` JVM start and adb round trips.
+pub const MAX_GESTURE_MS: u64 = 30_000;
+
+/// Duration for `input swipe`, in ms (1..=[`MAX_GESTURE_MS`]).
 pub fn duration_ms(d: std::time::Duration) -> u64 {
-    (d.as_millis() as u64).clamp(1, 60_000)
+    (d.as_millis() as u64).clamp(1, MAX_GESTURE_MS)
 }
 
 /// Start and end of a scroll gesture: the finger moves `amount` of the
@@ -277,12 +330,37 @@ pub fn join_scripts(cmds: Vec<String>) -> Vec<String> {
     out
 }
 
-/// ADBKeyBoard broadcast for text `input text` cannot type (any Unicode).
-pub fn adb_keyboard_script(text: &str) -> String {
+/// Prefix of one ADBKeyBoard broadcast.
+const ADB_KEYBOARD_PREFIX: &str = "am broadcast -a ADB_INPUT_B64 --es msg ";
+/// Most UTF-8 bytes per broadcast: base64 grows 4/3, and the prefix plus the
+/// ` 2>&1` that `run` appends must fit, so each script stays under [`SCRIPT_LIMIT`].
+const ADB_KEYBOARD_CHUNK: usize = (SCRIPT_LIMIT - 64) / 4 * 3;
+
+/// ADBKeyBoard broadcasts for text `input text` cannot type (any Unicode).
+/// Long text is split at char boundaries, one broadcast per chunk, and each
+/// chunk is valid UTF-8 on its own. Run them in order, one exec each.
+pub fn adb_keyboard_scripts(text: &str) -> Vec<(String, usize)> {
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    // Base64 is shell-safe ([A-Za-z0-9+/=]).
-    format!("am broadcast -a ADB_INPUT_B64 --es msg {b64}")
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut chars = 0;
+    let mut emit = |chunk: &str, chars: usize| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes());
+        // Base64 is shell-safe ([A-Za-z0-9+/=]).
+        out.push((format!("{ADB_KEYBOARD_PREFIX}{b64}"), chars));
+    };
+    for (i, c) in text.char_indices() {
+        if i + c.len_utf8() - start > ADB_KEYBOARD_CHUNK {
+            emit(&text[start..i], chars);
+            start = i;
+            chars = 0;
+        }
+        chars += 1;
+    }
+    if start < text.len() {
+        emit(&text[start..], chars);
+    }
+    out
 }
 
 /// Package and IME id of ADBKeyBoard (github.com/senzhk/ADBKeyBoard).
@@ -401,9 +479,16 @@ pub fn key_action(key: &Key, sdk: u32) -> Result<KeyAction> {
     let (mods, base) = key.parts();
     if let Key::Char(c) = base {
         // A plain or shifted character: typing it is the most reliable path.
-        if mods.is_empty() || (mods == shift_only() && !c.is_whitespace()) {
-            let c = if mods.shift { shifted(*c) } else { *c };
+        if mods.is_empty() {
             return Ok(KeyAction::Text(c.to_string()));
+        }
+        // Shift with no known shifted form falls through to keycombination,
+        // so the shift is never dropped.
+        if mods == shift_only()
+            && !c.is_whitespace()
+            && let Some(s) = shifted(*c)
+        {
+            return Ok(KeyAction::Text(s.to_string()));
         }
     }
     let (code, needs_shift) = keycode(base)
@@ -444,8 +529,42 @@ fn shift_only() -> Modifiers {
     }
 }
 
-fn shifted(c: char) -> char {
-    c.to_ascii_uppercase()
+/// The character Shift+`c` types on a US layout. A character that is
+/// already shifted (uppercase or a shifted symbol) maps to itself.
+fn shifted(c: char) -> Option<char> {
+    if c.is_alphabetic() {
+        let mut up = c.to_uppercase();
+        return match (up.next(), up.next()) {
+            (Some(u), None) => Some(u),
+            _ => None,
+        };
+    }
+    Some(match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' | '_' | '+' | '{' | '}' | '|'
+        | ':' | '"' | '<' | '>' | '?' | '~' => c,
+        _ => return None,
+    })
 }
 
 /// Detect an error printed by `input`, `am`, `pm` or `monkey`.
@@ -476,25 +595,28 @@ pub fn is_package_name(s: &str) -> bool {
         })
 }
 
-/// Foreground package from `dumpsys window` output. Reads `mCurrentFocus`
-/// first, then `mFocusedApp`. A focus window without a package (status bar,
-/// notification shade) gives `None`.
+/// Foreground package from `dumpsys window` output. `mCurrentFocus` (the
+/// window that has focus) decides: a focus window without a package (status
+/// bar, notification shade, keyguard, popup, `null`) gives `None`, because
+/// the app below it is not what is on screen. `mFocusedApp` is used only
+/// when there is no `mCurrentFocus` line at all. Heads-up notifications over
+/// an app do not take focus, so they are not detected here.
 pub fn parse_foreground_package(text: &str) -> Option<String> {
-    for key in ["mCurrentFocus=", "mFocusedApp="] {
-        for line in text.lines() {
-            let Some(rest) = line.split_once(key).map(|(_, r)| r) else {
-                continue;
-            };
-            let found = rest
-                .split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+    let package_in = |key: &str| -> Option<Option<String>> {
+        let rest = text
+            .lines()
+            .find_map(|l| l.split_once(key).map(|(_, r)| r))?;
+        Some(
+            rest.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
                 .filter_map(|tok| tok.split_once('/').map(|(pkg, _)| pkg))
-                .find(|pkg| is_package_name(pkg) && pkg.contains('.'));
-            if let Some(pkg) = found {
-                return Some(pkg.to_string());
-            }
-        }
+                .find(|pkg| is_package_name(pkg) && pkg.contains('.'))
+                .map(str::to_string),
+        )
+    };
+    match package_in("mCurrentFocus=") {
+        Some(focus) => focus,
+        None => package_in("mFocusedApp=").flatten(),
     }
-    None
 }
 
 /// Parse `pm list packages` into sorted package names.
@@ -583,12 +705,36 @@ mod tests {
         assert_eq!(p.sdk, 34);
         assert_eq!(p.pixels, Some((1080, 2400)));
         assert_eq!(p.dpi, Some(420));
+        assert_eq!(p.rotation, 0);
+        assert_eq!(p.rotated_pixels(), Some((1080, 2400)));
+        let land = format!("{out}@@AP@@\r\n    SurfaceOrientation: 1\r\n  mRotation=1\r\n");
+        let p = parse_info(&land);
+        assert_eq!(p.rotation, 1);
+        assert_eq!(p.pixels, Some((1080, 2400)));
+        assert_eq!(p.rotated_pixels(), Some((2400, 1080)));
         assert_eq!(display_name("Google", "Pixel 8"), "Google Pixel 8");
         assert_eq!(
             display_name("samsung", "SAMSUNG-SM-G900A"),
             "SAMSUNG-SM-G900A"
         );
         assert_eq!(display_name("", ""), "Android device");
+    }
+
+    #[test]
+    fn rotation_parsing() {
+        assert_eq!(parse_rotation("      SurfaceOrientation: 3\n"), 3);
+        assert_eq!(
+            parse_rotation(
+                "    Viewport INTERNAL: displayId=0, uniqueId=local:1, port=1, orientation=1, \
+                 logicalFrame=[0, 0, 2400, 1080]\n"
+            ),
+            1
+        );
+        assert_eq!(parse_rotation("  mRotation=2 mAltRotation=0\n"), 2);
+        assert_eq!(parse_rotation("  mCurrentRotation=ROTATION_270\n"), 3);
+        assert_eq!(parse_rotation("mCurrentAppOrientation=1\n"), 0);
+        assert_eq!(parse_rotation(""), 0);
+        assert_eq!(parse_rotation("/system/bin/sh: grep: not found"), 0);
     }
 
     #[test]
@@ -599,7 +745,8 @@ mod tests {
         assert_eq!(to_px(Point::new(1.0, 1.0), px), (1079, 2399));
         assert_eq!(to_px(Point::new(0.25, 0.1), px), (270, 240));
         assert_eq!(duration_ms(Duration::from_millis(0)), 1);
-        assert_eq!(duration_ms(Duration::from_secs(120)), 60_000);
+        assert_eq!(duration_ms(Duration::from_secs(120)), MAX_GESTURE_MS);
+        assert_eq!(duration_ms(Duration::from_secs(60)), MAX_GESTURE_MS);
         let (a, b) = scroll_points(Point::CENTER, SwipeDirection::Up, 0.4);
         assert!((a.y - 0.7).abs() < 1e-6 && (b.y - 0.3).abs() < 1e-6);
         assert_eq!(a.x, 0.5);
@@ -646,8 +793,39 @@ mod tests {
             .map(|c| c.len() - "input text ''".len())
             .sum();
         assert_eq!(typed, 10_000);
-        let k = adb_keyboard_script("dünya");
-        assert_eq!(k, "am broadcast -a ADB_INPUT_B64 --es msg ZMO8bnlh");
+        let k = adb_keyboard_scripts("dünya");
+        assert_eq!(
+            k,
+            vec![(
+                "am broadcast -a ADB_INPUT_B64 --es msg ZMO8bnlh".to_string(),
+                5
+            )]
+        );
+        assert!(adb_keyboard_scripts("").is_empty());
+    }
+
+    #[test]
+    fn adb_keyboard_chunks_long_text() {
+        use base64::Engine;
+        // Mix of 1-, 2-, 3- and 4-byte chars, ~25 KB.
+        let text = "çay ğüşiöı 漢字 😀 abc ".repeat(800);
+        let scripts = adb_keyboard_scripts(&text);
+        assert!(scripts.len() > 1);
+        let mut joined = String::new();
+        let mut chars = 0;
+        for (s, n) in &scripts {
+            assert!(s.len() + " 2>&1".len() <= SCRIPT_LIMIT, "{}", s.len());
+            let b64 = s.strip_prefix(ADB_KEYBOARD_PREFIX).unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap();
+            let chunk = String::from_utf8(bytes).expect("each chunk is valid UTF-8");
+            assert_eq!(chunk.chars().count(), *n);
+            chars += n;
+            joined.push_str(&chunk);
+        }
+        assert_eq!(joined, text);
+        assert_eq!(chars, text.chars().count());
     }
 
     #[test]
@@ -672,6 +850,21 @@ mod tests {
             key_action(&Key::parse("shift+a").unwrap(), 30).unwrap(),
             KeyAction::Text("A".into())
         );
+        for (k, t) in [
+            ("shift+1", "!"),
+            ("shift+/", "?"),
+            ("shift+2", "@"),
+            ("shift+-", "_"),
+            ("shift+'", "\""),
+            ("shift+?", "?"),
+            ("shift+ü", "Ü"),
+        ] {
+            assert_eq!(
+                key_action(&Key::parse(k).unwrap(), 30).unwrap(),
+                KeyAction::Text(t.into()),
+                "{k}"
+            );
+        }
         assert_eq!(
             key_action(&Key::parse("ctrl+a").unwrap(), 34).unwrap(),
             KeyAction::Shell("input keycombination 113 29".into())
@@ -754,8 +947,17 @@ mod tests {
         let shade = "  mCurrentFocus=Window{1 u0 NotificationShade}
   mFocusedApp=ActivityRecord{2 u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t3}
 ";
+        // The shade has focus: the launcher below it is not what is on screen.
+        assert_eq!(parse_foreground_package(shade), None);
+        let keyguard = "  mCurrentFocus=Window{3 u0 Keyguard}
+  mFocusedApp=ActivityRecord{4 u0 com.android.settings/.Settings t5}
+";
+        assert_eq!(parse_foreground_package(keyguard), None);
+        let no_focus_line =
+            "  mFocusedApp=ActivityRecord{2 u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t3}
+";
         assert_eq!(
-            parse_foreground_package(shade).as_deref(),
+            parse_foreground_package(no_focus_line).as_deref(),
             Some("com.google.android.apps.nexuslauncher")
         );
         assert_eq!(

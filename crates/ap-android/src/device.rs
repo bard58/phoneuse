@@ -116,7 +116,43 @@ impl AndroidDevice {
                 ),
             ));
         }
-        self.run(&parse::adb_keyboard_script(text)).await
+        // One exec per broadcast: joining them would pass the request limit again.
+        let mut typed = 0;
+        for (script, chars) in parse::adb_keyboard_scripts(text) {
+            self.run(&script).await.map_err(|e| {
+                if typed == 0 {
+                    e
+                } else {
+                    Error::protocol(format!(
+                        "typing stopped after {typed} of {} characters: {e}",
+                        text.chars().count()
+                    ))
+                }
+            })?;
+            typed += chars;
+        }
+        Ok(())
+    }
+}
+
+/// PNG file signature.
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// The PNG inside `screencap -p` output. `exec:` merges stderr into stdout,
+/// so warnings (multi-display, linker) can come before the image.
+fn png_payload(out: &[u8]) -> Result<&[u8]> {
+    match out
+        .windows(PNG_SIGNATURE.len())
+        .position(|w| w == PNG_SIGNATURE)
+    {
+        Some(i) => Ok(&out[i..]),
+        None => {
+            let text = String::from_utf8_lossy(&out[..out.len().min(200)]).into_owned();
+            Err(Error::protocol(format!(
+                "screencap did not return a PNG: {}",
+                text.trim()
+            )))
+        }
     }
 }
 
@@ -124,7 +160,9 @@ impl AndroidDevice {
 pub async fn query_info(transport: &dyn Transport, serial: &str) -> Result<(DeviceInfo, u32)> {
     let out = transport.exec(serial, parse::INFO_SCRIPT).await?;
     let p = parse::parse_info(&String::from_utf8_lossy(&out));
-    let (w, h) = p.pixels.ok_or_else(|| {
+    // `wm size` is the natural orientation; swap for landscape so taps map
+    // correctly before the first screenshot.
+    let (w, h) = p.rotated_pixels().ok_or_else(|| {
         Error::protocol(format!(
             "cannot read the screen size of {serial} (`wm size` gave no answer)"
         ))
@@ -155,15 +193,12 @@ impl Device for AndroidDevice {
     }
 
     async fn screenshot(&self) -> Result<Frame> {
-        let png = self.transport.exec(&self.serial, "screencap -p").await?;
-        if !png.starts_with(b"\x89PNG") {
-            let text = String::from_utf8_lossy(&png[..png.len().min(200)]).into_owned();
-            return Err(Error::protocol(format!(
-                "screencap did not return a PNG: {}",
-                text.trim()
-            )));
-        }
-        let frame = Frame::from_encoded(&png)?;
+        // adbd runs exec commands through `sh -c`, so the redirect works.
+        let out = self
+            .transport
+            .exec(&self.serial, "screencap -p 2>/dev/null")
+            .await?;
+        let frame = Frame::from_encoded(png_payload(&out)?)?;
         *self.pixels.lock().unwrap_or_else(|e| e.into_inner()) = frame.size();
         Ok(frame)
     }
@@ -397,6 +432,28 @@ pub(crate) mod tests {
         t.reply("com.android.adbkeyboard/.AdbIME\n");
         d.type_text("çay").await.unwrap();
         assert!(t.calls().last().unwrap().contains("ADB_INPUT_B64"));
+        // Long text -> one broadcast per chunk, each in its own exec.
+        t.calls.lock().unwrap().clear();
+        t.reply("com.android.adbkeyboard/.AdbIME\n");
+        d.type_text(&"ğ".repeat(5000)).await.unwrap();
+        let calls = t.calls();
+        assert!(calls.len() > 3);
+        assert!(
+            calls[1..]
+                .iter()
+                .all(|c| c.contains("ADB_INPUT_B64") && !c.contains("&&"))
+        );
+    }
+
+    #[tokio::test]
+    async fn landscape_maps_taps_before_screenshot() {
+        let t = Arc::new(FakeTransport::default());
+        t.reply(format!("{INFO_REPLY}@@AP@@\n    SurfaceOrientation: 1\n"));
+        let d = AndroidDevice::open(t.clone(), "SER1").await.unwrap();
+        assert_eq!(d.info().screen_pixels, Size::new(2400.0, 1080.0));
+        t.calls.lock().unwrap().clear();
+        d.tap(Point::new(0.9, 0.1)).await.unwrap();
+        assert_eq!(t.calls(), vec!["SER1$ input tap 2160 108 2>&1"]);
     }
 
     #[tokio::test]
@@ -415,8 +472,16 @@ pub(crate) mod tests {
         assert_eq!((f.width, f.height), (24, 12));
         d.tap(Point::CENTER).await.unwrap();
         assert_eq!(t.calls()[1], "SER1$ input tap 12 6 2>&1");
+        assert_eq!(t.calls()[0], "SER1$ screencap -p 2>/dev/null");
         t.reply("Error: secure");
         assert!(d.screenshot().await.is_err());
+        // Warnings that still come before the PNG are skipped.
+        let mut noisy =
+            b"[Warning] Multiple displays were found, but no display id was specified!\n".to_vec();
+        noisy.extend(Frame::solid(8, 4, [1, 2, 3, 255]).to_png().unwrap());
+        t.reply(noisy);
+        let f = d.screenshot().await.unwrap();
+        assert_eq!((f.width, f.height), (8, 4));
     }
 
     #[tokio::test]
