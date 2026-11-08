@@ -76,9 +76,9 @@ key `ios.backend_order` keeps room for more routes.
 | 15 | not supported, update iOS | - | - | - |
 | 16 | not supported, update iOS | - | - | - |
 | 17.0 to 17.3 | not supported, update iOS | - | - | - |
-| 17.4 to 17.x | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: the stream is refused (reported, no 17.x device log) | DVT |
-| 18 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: error 9021 (reported on 18.7.3) | DVT |
-| 26 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | none: error 9021 (reported on 26.3 and 26.7) | DVT |
+| 17.4 to 17.x | connects (unverified) | CoreDeviceProxy + jktcp + RSD | no touch: the stream is refused (reported, no 17.x device log). Buttons and keys over IndigoHid without the stream (screen only mode) | DVT |
+| 18 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | no touch: error 9021 (reported on 18.7.3). Buttons and keys over IndigoHid without the stream (screen only mode) | DVT |
+| 26 | connects (unverified) | CoreDeviceProxy + jktcp + RSD | no touch: error 9021 (reported on 26.3 and 26.7). Buttons and keys over IndigoHid without the stream (screen only mode) | DVT |
 | 27 | supported (unverified) | CoreDeviceProxy + jktcp + RSD | CoreDevice HID + displayservice gate | DVT |
 
 Evidence for the input column (public reports, not tested with agentphone):
@@ -94,7 +94,11 @@ Design notes for `ap-ios`:
   build overflowed the 1 MiB Windows main stack.
 - `HidBackend` keeps one tunnel and one displayservice media stream for each
   session. The media stream is the gate for HID input. Two tasks read and drop
-  the RTP data.
+  the RTP data. The HID clients connect before the stream. If the device
+  refuses the stream (error 9021, or any failure below iOS 27), the session
+  keeps IndigoHid for buttons and keys, and touch calls return a setup error
+  with the update fix. Below iOS 27 a touch call fails before any I/O, and
+  the capabilities have no `tap` and no `swipe`.
 - A transport error closes the session, and the next call opens a new one.
   Input is not replayed. An input call runs once more only when the error
   came before its first event. Otherwise it returns an "input may be partly

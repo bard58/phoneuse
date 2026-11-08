@@ -127,6 +127,40 @@ fn problem(e: &Error) -> String {
     }
 }
 
+/// The `hid_services` check. The services can be present on iOS 17.4 to
+/// 26.x, but the device refuses the screen stream there (error 9021), so
+/// touch input fails. Thus below iOS 27 the check is a warning with the
+/// update fix, also when every service is present.
+pub fn hid_services_check(version: IosVersion, missing: &[&str]) -> CheckResult {
+    if !missing.is_empty() {
+        return CheckResult::bad(
+            "hid_services",
+            Status::Fail,
+            format!("missing RSD services: {}", missing.join(", ")),
+            format!(
+                "this iOS build or this DDI does not have the CoreDevice HID services; remount the DDI. If they stay missing, agentphone cannot drive iOS {version}"
+            ),
+            Some(Action::MountDdi),
+        );
+    }
+    if !version.touch_supported() {
+        return CheckResult::bad(
+            "hid_services",
+            Status::Warn,
+            format!(
+                "{} Screenshots, buttons and keys work. The HID services are present, but the iPhone refuses the screen stream that touch needs (CoreDevice error 9021).",
+                ap_core::ios_touch_problem(&version.to_string())
+            ),
+            ap_core::IOS_UPDATE_HINT,
+            None,
+        );
+    }
+    CheckResult::ok(
+        "hid_services",
+        "HID (indigo, universalhidservice), displayservice and dtservicehub are present",
+    )
+}
+
 /// Every check name, in order.
 pub const CHECK_NAMES: &[&str] = &[
     "usbmuxd",
@@ -414,21 +448,7 @@ async fn run_checks(cfg: IosConfig, id: Option<String>) -> Vec<CheckResult> {
     };
 
     // 8. HID + displayservice
-    let missing = t.missing();
-    if missing.is_empty() {
-        out.push(CheckResult::ok(
-            "hid_services",
-            "HID (indigo, universalhidservice), displayservice and dtservicehub are present",
-        ));
-    } else {
-        out.push(CheckResult::bad(
-            "hid_services",
-            Status::Fail,
-            format!("missing RSD services: {}", missing.join(", ")),
-            format!("this iOS build or this DDI does not have the CoreDevice HID services; remount the DDI. If they stay missing, agentphone cannot drive iOS {version}"),
-            Some(Action::MountDdi),
-        ));
-    }
+    out.push(hid_services_check(version, &t.missing()));
     drop(t);
 
     // 9. Wi-Fi pairing
@@ -880,6 +900,35 @@ mod tests {
         let e = Error::setup("no tunnel", "run setup");
         assert_eq!(problem(&e), "no tunnel");
         assert!(!problem(&Error::Other("x".into())).contains("fix:"));
+    }
+
+    #[test]
+    fn hid_services_warns_below_ios_27() {
+        let v = |s: &str| IosVersion::parse(s).unwrap();
+        let c = hid_services_check(v("26.3"), &[]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.detail
+                .starts_with("Touch input needs iOS 27 or later. This iPhone has iOS 26.3."),
+            "{}",
+            c.detail
+        );
+        assert_eq!(
+            c.fix_hint.as_deref(),
+            Some("Update the iPhone in Settings > General > Software Update.")
+        );
+        assert_eq!(hid_services_check(v("17.4"), &[]).status, Status::Warn);
+        assert_eq!(hid_services_check(v("27.0"), &[]).status, Status::Ok);
+        let c = hid_services_check(v("27.0"), &["com.apple.coredevice.hid.indigo"]);
+        assert_eq!(
+            (c.status, c.fix_action),
+            (Status::Fail, Some(Action::MountDdi))
+        );
+        // A missing service is still a failure below 27.
+        assert_eq!(
+            hid_services_check(v("26.3"), &["com.apple.coredevice.displayservice"]).status,
+            Status::Fail
+        );
     }
 
     #[test]

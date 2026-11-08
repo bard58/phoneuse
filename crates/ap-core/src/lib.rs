@@ -19,7 +19,10 @@ pub mod mock;
 
 pub use async_trait::async_trait;
 pub use config::{AndroidConfig, Config, IosConfig, LlmConfig, SafetyConfig};
-pub use device::{Capabilities, Device, DeviceInfo, DeviceProvider, Platform};
+pub use device::{
+    Capabilities, Device, DeviceInfo, DeviceProvider, IOS_TOUCH_MIN_MAJOR, IOS_UPDATE_HINT,
+    Platform, ios_touch_error, ios_touch_message, ios_touch_problem, touch_unavailable,
+};
 pub use error::{Error, Result};
 pub use frame::Frame;
 pub use geometry::{Point, Size};

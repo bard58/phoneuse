@@ -579,6 +579,29 @@ Android
         assert!(p.fix.as_deref().unwrap().contains("setup llm"));
     }
 
+    /// Below iOS 27 the "Touch and keyboard input" line warns with the
+    /// update fix, but it does not fail doctor (screen and buttons work).
+    #[test]
+    fn touch_input_warns_below_ios_27() {
+        let v = |s: &str| ap_ios::IosVersion::parse(s).unwrap();
+        let checks = crate::ios::convert(vec![ap_ios::setup::hid_services_check(v("26.3"), &[])]);
+        let c = &checks[0];
+        assert_eq!(
+            (c.id.as_str(), c.name.as_str(), c.status),
+            ("hid_services", "Touch and keyboard input", Status::Warn)
+        );
+        assert!(c.detail.contains("needs iOS 27"), "{}", c.detail);
+        assert_eq!(
+            c.fix.as_deref(),
+            Some("Update the iPhone in Settings > General > Software Update.")
+        );
+        assert!(!any_failed(&checks));
+        let out = render(&checks, false);
+        assert!(out.contains("Software Update"), "{out}");
+        let ok = crate::ios::convert(vec![ap_ios::setup::hid_services_check(v("27.0.1"), &[])]);
+        assert_eq!(ok[0].status, Status::Ok);
+    }
+
     #[test]
     fn ocr_fix_works_without_a_checkout() {
         assert!(OCR_INSTALL.contains("--git") && !OCR_INSTALL.contains("--path"));

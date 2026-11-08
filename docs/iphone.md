@@ -12,14 +12,20 @@ rights. It needs a USB cable one time. After the setup, it can also use Wi-Fi.
 ## Requirements
 
 - An iPhone with iOS 17.4 or later. iOS 17.3 and earlier are not supported.
-  Touch and keyboard input need an iOS 27 release build or later. Early
-  iOS 27 betas list no HID service. Below iOS 27, the iPhone refuses the
-  display stream with CoreDevice error 9021 (reported on iOS 18 and 26,
-  expected on 17.x), and only screenshots can work.
+  Touch input (tap, swipe, pinch) needs an iOS 27 release build or later.
+  Early iOS 27 betas list no HID service. Below iOS 27, the iPhone refuses
+  the display stream with CoreDevice error 9021 (reported on iOS 18 and 26,
+  expected on 17.x). agentphone then works in "screen only" mode:
+  screenshots, hardware buttons, and keys can work, but touch calls stop
+  with the error "Touch input needs iOS 27 or later. This iPhone has iOS X.
+  Update the iPhone in Settings > General > Software Update." Public reports
+  say that iOS 26 accepts buttons without the stream. This is unverified on
+  agentphone.
 - Models newer than `iPhone18,5` can need a Cryptex1 developer disk image
   for input. agentphone does not support Cryptex1 yet.
-- iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
-  touch input does not work, because these models cannot get iOS 27.
+- iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them in
+  screen only mode. Touch input does not work, because these models cannot
+  get iOS 27.
 - A USB data cable (the cable in the box is correct).
 - The passcode of the iPhone. You type it on the iPhone, not in agentphone.
 - An Internet connection for the first setup and after each restart of the
@@ -219,7 +225,7 @@ names from `crates/ap-ios/src/setup.rs` and the names that doctor shows.
 | `developer_mode` | Developer Mode | Developer Mode is off. | Do [step 4](#4-turn-on-developer-mode). |
 | `ddi` | Developer disk image | The DDI is not mounted. | Run `agentphone setup ios`. Do this after each restart. |
 | `tunnel` | Secure connection | The CoreDevice tunnel does not open. | Unlock the iPhone. Connect the cable again. Run doctor again. |
-| `hid_services` | Touch and keyboard input | The iPhone does not have the HID services. | Mount the DDI again. If the services stay missing, agentphone cannot control this iOS version. |
+| `hid_services` | Touch and keyboard input | Fail: the iPhone does not have the HID services. Warning: iOS is older than 27, so touch input does not work (screen only). | Fail: mount the DDI again. If the services stay missing, agentphone cannot control this iOS version. Warning: update the iPhone in Settings > General > Software Update. |
 | `wifi_pairing` | Wi-Fi pairing | No Wi-Fi pairing is saved (warning only). | Do [step 6](#6-optional-use-wi-fi) with the cable connected. |
 
 When one check fails, doctor does not show the checks after it. Fix the first
@@ -230,11 +236,18 @@ problem, then run `agentphone doctor` again.
 - Typing uses a US keyboard layout. For text with accents, other scripts, or
   emoji, agentphone puts the text on the pasteboard and sends Cmd+V. This
   fallback is unverified.
-- Touch and keyboard input need iOS 27 or later. Below iOS 27, the iPhone
-  refuses the display stream with CoreDevice error 9021 (reported on iOS 18
-  and 26, expected on 17.x). This includes every iPhone XS, XS Max, and XR,
-  because they stop at iOS 18. The `hid_services` check looks only for the
-  services. It can pass on these versions while input fails.
+- Touch input needs iOS 27 or later. Below iOS 27, the iPhone refuses the
+  display stream with CoreDevice error 9021 (reported on iOS 18 and 26,
+  expected on 17.x). This includes every iPhone XS, XS Max, and XR, because
+  they stop at iOS 18. On these versions:
+  - The `hid_services` check is a warning with the update fix.
+  - The device capabilities have no `tap` and no `swipe`. `agentphone info`
+    and the MCP `status` tool show "screen only" and the reason.
+  - A touch call stops at once with the update message. It sends nothing.
+  - `agentphone run` stops before the first AI model call, because the agent
+    cannot do a task without touch.
+  - Buttons and keys go to the IndigoHid service without the stream. This
+    is unverified.
 - Models newer than `iPhone18,5` can need a Cryptex1 developer disk image.
   agentphone does not support Cryptex1 yet, so input can fail on these
   models.

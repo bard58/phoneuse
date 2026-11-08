@@ -262,6 +262,17 @@ impl Agent {
         if self.cancel.is_cancelled() {
             return self.finish(Outcome::Cancelled, st);
         }
+        // A phone with no touch input (an iPhone below iOS 27) cannot do a
+        // task: stop before the first LLM call instead of looping on taps
+        // that fail.
+        if let Some(why) = ap_core::touch_unavailable(info, self.device.capabilities()) {
+            return self.finish(
+                Outcome::Failed {
+                    error: format!("screen only, no touch input: {why}"),
+                },
+                st,
+            );
+        }
 
         let first = match self.guard(self.observer.look(&*self.device)).await {
             None => return self.finish(Outcome::Cancelled, st),

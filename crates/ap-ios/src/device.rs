@@ -72,7 +72,7 @@ async fn open_backend(kind: BackendKind, r: &Resolved) -> Result<Box<dyn IosBack
         BackendKind::Hid => {
             let mut last = None;
             for source in r.sources() {
-                let mut b = HidBackend::new(source.clone(), r.lockdown.clone());
+                let mut b = HidBackend::new(source.clone(), r.lockdown.clone(), r.version);
                 match Box::pin(b.connect()).await {
                     Ok(()) => return Ok(Box::new(b)),
                     Err(e) => {

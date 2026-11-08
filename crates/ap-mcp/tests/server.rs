@@ -813,3 +813,32 @@ async fn tap_on_matches_the_lines_the_agent_sees() {
     );
     c.cancel().await.unwrap();
 }
+
+/// status says "screen only" and gives the iOS 27 update text when the
+/// phone has no touch input.
+#[tokio::test]
+async fn status_says_screen_only_without_touch() {
+    let mock = MockDevice::new().with_capabilities(Capabilities {
+        tap: false,
+        swipe: false,
+        ..Capabilities::ALL
+    });
+    let c = client(PhoneServer::with_options(
+        StaticSource::new(mock),
+        opts(OcrSetting::Off),
+    ))
+    .await;
+    let s = text(&call(&c, "status", json!({})).await);
+    assert!(s.contains("touch: none (screen only"), "{s}");
+    assert!(s.contains("Touch input needs iOS 27 or later"), "{s}");
+    c.cancel().await.unwrap();
+
+    let c = client(PhoneServer::with_options(
+        StaticSource::new(MockDevice::new()),
+        opts(OcrSetting::Off),
+    ))
+    .await;
+    let s = text(&call(&c, "status", json!({})).await);
+    assert!(!s.contains("touch: none"), "{s}");
+    c.cancel().await.unwrap();
+}

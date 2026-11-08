@@ -1082,3 +1082,35 @@ async fn empty_turn_gets_a_placeholder() {
     assert_eq!(m.role, Role::Assistant);
     assert_eq!(m.content, vec![ContentBlock::text("(no response)")]);
 }
+
+/// An iPhone below iOS 27 has no touch input: the run stops before the
+/// first LLM call with the update message, and it sends no tap.
+#[tokio::test]
+async fn no_touch_input_stops_before_the_first_llm_call() {
+    let dev = mock().with_capabilities(ap_core::Capabilities {
+        tap: false,
+        swipe: false,
+        ..ap_core::Capabilities::ALL
+    });
+    let p = Scripted::new(vec![call("tap", json!({"x": 0.5, "y": 0.5}))]);
+    let out = agent(
+        p.clone(),
+        &dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("open Settings")
+    .await;
+    let Outcome::Failed { error } = &out.outcome else {
+        panic!("{:?}", out.outcome);
+    };
+    assert!(error.starts_with("screen only, no touch input:"), "{error}");
+    assert!(
+        error.contains("Touch input needs iOS 27 or later. This iPhone has iOS 26.0.")
+            && error.contains("Software Update"),
+        "{error}"
+    );
+    assert_eq!(out.steps, 0);
+    assert!(p.requests().is_empty());
+    assert!(dev.calls().is_empty());
+}

@@ -83,8 +83,13 @@ fn done(json: bool, what: &str, extra: serde_json::Value) -> Result<()> {
 }
 
 pub fn print_info(info: &DeviceInfo, caps: ap_core::Capabilities, json: bool) -> Result<()> {
+    let no_touch = ap_core::touch_unavailable(info, caps);
     if json {
-        return ui::json(&json!({ "device": info, "capabilities": caps.names() }));
+        return ui::json(&json!({
+            "device": info,
+            "capabilities": caps.names(),
+            "touch_unavailable": no_touch,
+        }));
     }
     println!("{}", console::style(&info.name).bold());
     println!("  id:        {}", info.id);
@@ -104,6 +109,9 @@ pub fn print_info(info: &DeviceInfo, caps: ap_core::Capabilities, json: bool) ->
     );
     println!("  backend:   {}", info.backend);
     println!("  can do:    {}", caps.names().join(", "));
+    if let Some(why) = no_touch {
+        println!("  touch:     none, screen only. {why}");
+    }
     Ok(())
 }
 

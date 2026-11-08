@@ -998,10 +998,13 @@ impl<S: DeviceSource> PhoneServer<S> {
                     i.screen_pixels.width,
                     i.screen_pixels.height
                 ));
-                out.push(format!(
-                    "capabilities: {}",
-                    d.capabilities().names().join(", ")
-                ));
+                let caps = d.capabilities();
+                out.push(format!("capabilities: {}", caps.names().join(", ")));
+                if let Some(why) = ap_core::touch_unavailable(i, caps) {
+                    out.push(format!(
+                        "touch: none (screen only: screenshots, buttons, keys). {why}"
+                    ));
+                }
             }
             Err(e) => {
                 out.push("device: not connected".into());

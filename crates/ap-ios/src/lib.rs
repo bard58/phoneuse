@@ -4,6 +4,9 @@
 //! Supported: iOS 17.4 and later (Route B: CoreDeviceProxy tunnel with the
 //! jktcp userspace TCP stack, CoreDevice HID input, DVT screenshot). Below
 //! iOS 17.4, discovery lists the device and `connect` returns a setup error.
+//! Touch input needs iOS 27 or later. On iOS 17.4 to 26.x the device is
+//! "screen only": the capabilities have no `tap` and no `swipe`, and a touch
+//! call returns [`ap_core::ios_touch_error`].
 //!
 //! - [`IosProvider`]: a [`DeviceProvider`](ap_core::DeviceProvider). Finds
 //!   devices over usbmuxd (Windows: Apple Mobile Device Service on

@@ -2,10 +2,15 @@
 //!
 //! Only one software route is built: Route B (CoreDevice HID + DVT screenshot
 //! over a CoreDeviceProxy tunnel). It needs iOS 17.4 or later.
+//!
+//! Connection, screenshots, buttons and keys work from iOS 17.4. Touch input
+//! needs iOS 27 or later ([`IosVersion::touch_supported`]): iOS 17.4 to 26.x
+//! refuse the screen stream with CoreDevice error 9021 ("Remote control
+//! requires iOS 27.0 or later on this device").
 
 use std::fmt;
 
-use ap_core::{Error, Result};
+use ap_core::{Capabilities, Error, IOS_TOUCH_MIN_MAJOR, Result};
 use serde::{Deserialize, Serialize};
 
 /// The hint for devices below iOS 17.4.
@@ -32,6 +37,9 @@ impl IosVersion {
     /// The first version with CoreDeviceProxy over lockdown (USB or Wi-Fi).
     pub const MIN_SUPPORTED: IosVersion = IosVersion::new(17, 4, 0);
 
+    /// The first version with touch input over CoreDevice HID.
+    pub const MIN_TOUCH: IosVersion = IosVersion::new(IOS_TOUCH_MIN_MAJOR, 0, 0);
+
     /// Parse `17`, `17.4` or `17.4.1`. Extra text after a number is ignored
     /// (`26.0b2` gives 26.0).
     pub fn parse(s: &str) -> Option<Self> {
@@ -51,6 +59,29 @@ impl IosVersion {
     /// exists from iOS 17.4.
     pub fn has_core_device_proxy(self) -> bool {
         self >= Self::MIN_SUPPORTED
+    }
+
+    /// Touch input (tap, swipe, pinch) through CoreDevice HID needs iOS 27.
+    /// Below 27 the device refuses the screen stream (error 9021) and drops
+    /// every touch event.
+    pub fn touch_supported(self) -> bool {
+        self >= Self::MIN_TOUCH
+    }
+
+    /// What Route B can do on this version. Below iOS 27: screen only
+    /// (screenshots, buttons, keys, text, app launch), no tap or swipe.
+    pub fn capabilities(self) -> Capabilities {
+        let touch = self.touch_supported();
+        Capabilities {
+            tap: touch,
+            swipe: touch,
+            type_text: true,
+            keys: true,
+            buttons: true,
+            launch_app: true,
+            ui_tree: false,
+            screenshot: true,
+        }
     }
 
     /// Developer Mode exists from iOS 16.
@@ -97,7 +128,7 @@ impl Route {
     pub fn describe(self) -> &'static str {
         match self {
             Route::CoreDeviceHid => {
-                "CoreDevice HID + DVT screenshot over a CoreDeviceProxy tunnel (iOS 17.4+)"
+                "CoreDevice HID + DVT screenshot over a CoreDeviceProxy tunnel (iOS 17.4+, touch input from iOS 27)"
             }
             Route::Unsupported => "not supported (iOS 17.4 or later is required)",
         }
@@ -191,6 +222,24 @@ mod tests {
         assert!(!IosVersion::new(15, 0, 0).has_developer_mode());
         assert!(IosVersion::new(16, 0, 0).has_developer_mode());
         assert!(IosVersion::new(17, 0, 0).uses_personalized_ddi());
+    }
+
+    #[test]
+    fn touch_gate_per_version() {
+        let v = |s: &str| IosVersion::parse(s).unwrap();
+        for old in ["17.4", "18.7.3", "26.3", "26.7.1"] {
+            assert!(!v(old).touch_supported(), "{old}");
+            let c = v(old).capabilities();
+            assert!(!c.tap && !c.swipe && !c.has_touch(), "{old}");
+            assert!(c.screenshot && c.buttons && c.keys && c.type_text, "{old}");
+            // Connection and screenshots stay allowed below 27.
+            assert_eq!(v(old).route(), Route::CoreDeviceHid);
+            assert!(select_backends(v(old), &order(&["hid"])).is_ok());
+        }
+        for new in ["27.0", "27.0.1", "28.1"] {
+            assert!(v(new).touch_supported(), "{new}");
+            assert!(v(new).capabilities().has_touch(), "{new}");
+        }
     }
 
     #[test]
