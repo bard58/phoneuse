@@ -8,10 +8,27 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Pure-Rust OCR with the `ocrs` engine (rten models downloaded at runtime).
+ocr = ["dep:ocrs", "dep:rten", "dep:reqwest", "dep:rustls", "dep:sha2", "dep:futures", "dep:directories"]
+
 [dependencies]
 ap-core.workspace = true
 image.workspace = true
 tracing.workspace = true
+ocrs = { version = "=0.13.1", default-features = false, features = ["onnx"], optional = true }
+# Must match the rten version ocrs 0.13.1 uses.
+rten = { version = "=0.26.0", default-features = false, features = ["onnx_format"], optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+sha2 = { version = "0.10.9", optional = true }
+futures = { workspace = true, optional = true }
+directories = { workspace = true, optional = true }
+
+[dev-dependencies]
+ap-core = { workspace = true, features = ["mock"] }
+tokio.workspace = true
 
 [lints]
 workspace = true
