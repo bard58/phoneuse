@@ -1,19 +1,103 @@
 # agentphone
 
-Let an AI agent use your iPhone or Android phone from Windows, macOS or Linux.
-One static Rust binary: `agentphone`.
+agentphone lets an AI agent see and operate your iPhone or Android phone from a
+Windows, macOS, or Linux computer. It is one Rust binary, `agentphone`. You can
+give it a task in plain language (`agentphone run "turn on Wi-Fi"`), or connect
+it to Claude Code, Claude Desktop, or Cursor as an MCP server. An iPhone needs
+no Mac, no Xcode, and no app on the phone. agentphone is a cross-platform
+rewrite of [phoneuse](https://github.com/lxe/phoneuse), which runs on Linux only.
 
-Status: early rewrite. Full documentation is in progress.
+## Status
 
-## Build
+agentphone is early software. Read this before you use it.
 
-```sh
-cargo build --release -p ap-cli
-./target/release/agentphone --help
-```
+- The code builds and the unit tests pass on Windows.
+- Nobody tested agentphone on a real phone yet. Every device path (iPhone and
+  Android) is unverified.
+- iPhone touch input uses the CoreDevice HID services. These services are
+  known on iOS 26. On iOS 17.4 to 18 they can be missing, so touch input on
+  those versions can fail. `agentphone doctor` shows this as the
+  "Touch and keyboard input" check.
+- Report problems in the issue tracker of
+  [bard58/phoneuse](https://github.com/bard58/phoneuse/issues).
 
-## Origin and licence
+## Quick start (Windows)
+
+1. Get the binary. Download `agentphone.exe` from the
+   [releases page](https://github.com/bard58/phoneuse/releases)
+   (no release is published yet), or build it with Rust:
+
+   ```powershell
+   cargo install --git https://github.com/bard58/phoneuse --branch rust-rewrite ap-cli
+   ```
+
+2. Open a terminal and run `agentphone`. On the first run, the setup wizard
+   starts.
+3. Do the wizard steps. It sets up the phone, the AI model, and Claude Code.
+   For an iPhone, see [docs/iphone.md](docs/iphone.md). For Android, see
+   [docs/android.md](docs/android.md).
+4. Give the agent a task:
+
+   ```powershell
+   agentphone run "open Settings and turn on Wi-Fi"
+   ```
+
+5. Optional: add agentphone to Claude Code as an MCP server:
+
+   ```powershell
+   claude mcp add --scope user agentphone -- agentphone mcp
+   ```
+
+Run `agentphone doctor` when something does not work.
+
+## Supported devices
+
+| Phone | Requirement | Connection | Status |
+|---|---|---|---|
+| iPhone XS, XR, and newer | iOS 17.4 or later, Developer Mode, one USB pairing | USB, then Wi-Fi | unverified on a device |
+| iPhone 13 | iOS 17.4 to 26 | USB, then Wi-Fi | target model, unverified on a device |
+| iPhone with iOS 17.3 or earlier | not supported. Update iOS. | - | - |
+| Android phone | USB debugging | USB, or Wi-Fi (Android 11 or later, `adb pair`) | unverified on a device |
+
+| Computer | iPhone needs | Android needs |
+|---|---|---|
+| Windows 10 or 11 | Apple Devices app (Microsoft Store) or iTunes | Google platform-tools (`adb`) |
+| macOS | nothing more | Google platform-tools (`adb`) |
+| Linux | `usbmuxd` | Google platform-tools (`adb`) |
+
+agentphone needs no administrator rights.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `agentphone setup [ios\|android\|llm\|mcp\|ocr]` | Step-by-step setup. You can run it again. |
+| `agentphone doctor` | Examines the setup and prints one fix for each problem. |
+| `agentphone devices`, `use <id>`, `info` | Lists phones, sets the default phone, shows details. |
+| `agentphone screenshot [-o FILE] [--grid]` | Saves a PNG of the screen. |
+| `agentphone tap X Y`, `long-press X Y`, `swipe X1 Y1 X2 Y2`, `scroll DIR` | Touch input. X and Y are fractions from 0 to 1. Add `--px` for pixels. |
+| `agentphone tap-on "TEXT"` | Finds text on the screen and taps it. Needs OCR. |
+| `agentphone type "TEXT"`, `key KEY`, `button NAME` | Keyboard and hardware buttons. |
+| `agentphone open APP`, `apps`, `ui-tree` | Opens an app, lists apps, prints the UI tree. |
+| `agentphone run "TASK"` | The AI agent does the task. |
+| `agentphone mcp [--http [ADDR]]` | Starts the MCP server. |
+| `agentphone config show\|path\|set KEY VALUE\|edit` | Shows or changes the configuration. |
+| `agentphone completions SHELL` | Prints a shell completion script. |
+
+## Documentation
+
+- [docs/iphone.md](docs/iphone.md): iPhone setup on Windows, macOS, and Linux
+- [docs/android.md](docs/android.md): Android setup
+- [docs/agent.md](docs/agent.md): `agentphone run`, AI providers, cost, safety
+- [docs/mcp.md](docs/mcp.md): Claude Code, Claude Desktop, Cursor, and HTTP mode
+- [docs/architecture.md](docs/architecture.md): crates, the `Device` trait, new backends
+- [docs/troubleshooting.md](docs/troubleshooting.md) and [docs/faq.md](docs/faq.md)
+- [docs/legacy.md](docs/legacy.md): the original Python version
+
+## Credits and license
 
 agentphone is a Rust rewrite of [phoneuse](https://github.com/lxe/phoneuse) by
-Aleksey Smolenchuk (MIT). The folder `legacy/python/` holds the original Python code.
-This project also uses the MIT licence. See `LICENSE`.
+Aleksey Smolenchuk. phoneuse uses the MIT license. Its Python code is in
+`legacy/python/`. agentphone also uses the MIT license. See [LICENSE](LICENSE).
+
+The iPhone backend uses the [idevice](https://crates.io/crates/idevice) crate.
