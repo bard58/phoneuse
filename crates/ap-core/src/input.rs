@@ -16,16 +16,19 @@ pub enum Button {
     VolumeDown,
     Siri,
     AppSwitcher,
+    /// System back: Android KEYCODE_BACK; on iOS a back edge swipe.
+    Back,
 }
 
 impl Button {
-    pub const ALL: [Button; 6] = [
+    pub const ALL: [Button; 7] = [
         Button::Home,
         Button::Lock,
         Button::VolumeUp,
         Button::VolumeDown,
         Button::Siri,
         Button::AppSwitcher,
+        Button::Back,
     ];
 
     /// Parse names like `home`, `volume-up`, `VolumeUp`, `power`.
@@ -42,6 +45,7 @@ impl Button {
             "volumedown" | "voldown" => Button::VolumeDown,
             "siri" | "assistant" => Button::Siri,
             "appswitcher" | "recents" | "multitask" => Button::AppSwitcher,
+            "back" => Button::Back,
             _ => return None,
         })
     }
@@ -280,6 +284,8 @@ mod tests {
         assert_eq!(Button::parse("volume-up"), Some(Button::VolumeUp));
         assert_eq!(Button::parse("Power"), Some(Button::Lock));
         assert_eq!(Button::parse("x"), None);
+        assert_eq!(Button::parse("Back"), Some(Button::Back));
+        assert!(Button::ALL.contains(&Button::Back));
         assert_eq!(SwipeDirection::parse("UP"), Some(SwipeDirection::Up));
         assert_eq!(SwipeDirection::Left.opposite(), SwipeDirection::Right);
         assert_eq!(SwipeDirection::Down.vector(), (0.0, 1.0));

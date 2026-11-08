@@ -28,13 +28,15 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// "anthropic" or "openai" (OpenAI-compatible).
+    /// "anthropic", or an OpenAI-compatible provider: "openai", "openrouter", "ollama",
+    /// "lmstudio", or any other name (all use the OpenAI wire format).
     pub provider: String,
     pub model: String,
     /// Optional base URL override (proxies, local OpenAI-compatible servers).
     pub base_url: Option<String>,
     pub anthropic_api_key_env: String,
     pub openai_api_key_env: String,
+    /// Output token limit per call. Extended thinking counts toward it, so keep it large.
     pub max_tokens: u32,
 }
 
@@ -46,33 +48,51 @@ impl Default for LlmConfig {
             base_url: None,
             anthropic_api_key_env: "ANTHROPIC_API_KEY".into(),
             openai_api_key_env: "OPENAI_API_KEY".into(),
-            max_tokens: 4096,
+            max_tokens: 16000,
         }
     }
 }
 
 impl LlmConfig {
-    /// Env var holding the API key for the configured provider.
+    /// True when the provider is Anthropic. Every other provider is OpenAI-compatible.
+    pub fn is_anthropic(&self) -> bool {
+        let p = self.provider.trim();
+        p.eq_ignore_ascii_case("anthropic") || p.eq_ignore_ascii_case("claude")
+    }
+
+    /// True for local OpenAI-compatible servers that need no API key (Ollama, LM Studio).
+    pub fn key_optional(&self) -> bool {
+        let p = self.provider.trim().to_ascii_lowercase();
+        matches!(
+            p.as_str(),
+            "ollama" | "lmstudio" | "lm-studio" | "lm_studio"
+        )
+    }
+
+    /// Env var holding the API key for the configured provider:
+    /// `anthropic_api_key_env` for "anthropic", `openai_api_key_env` for all others.
     pub fn api_key_env(&self) -> &str {
-        if self.provider.eq_ignore_ascii_case("openai") {
-            &self.openai_api_key_env
-        } else {
+        if self.is_anthropic() {
             &self.anthropic_api_key_env
+        } else {
+            &self.openai_api_key_env
         }
     }
 
     /// Read the API key from the environment.
+    ///
+    /// For providers that need no key (see [`LlmConfig::key_optional`]) a missing
+    /// key returns `Ok(String::new())`.
     pub fn api_key(&self) -> Result<String> {
         let var = self.api_key_env();
-        std::env::var(var)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                Error::setup(
-                    format!("no API key for provider '{}'", self.provider),
-                    format!("set the environment variable {var} to your API key"),
-                )
-            })
+        match std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+            Some(k) => Ok(k),
+            None if self.key_optional() => Ok(String::new()),
+            None => Err(Error::setup(
+                format!("no API key for provider '{}'", self.provider),
+                format!("set the environment variable {var} to your API key"),
+            )),
+        }
     }
 }
 
@@ -102,7 +122,8 @@ impl Default for SafetyConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IosConfig {
-    /// Backends to try in order: "hid" (CoreDevice HID), "wda" (WebDriverAgent), "dongle".
+    /// Backends to try in order. Only "hid" (CoreDevice HID) exists today; the field
+    /// stays a list so a future backend can be added.
     pub backend_order: Vec<String>,
     /// URL of an already-running WebDriverAgent, if any.
     pub wda_url: Option<String>,
@@ -117,7 +138,7 @@ pub struct IosConfig {
 impl Default for IosConfig {
     fn default() -> Self {
         Self {
-            backend_order: vec!["hid".into(), "wda".into()],
+            backend_order: vec!["hid".into()],
             wda_url: None,
             wda_port: 8100,
             wda_bundle_id: "com.facebook.WebDriverAgentRunner.xctrunner".into(),
@@ -213,8 +234,52 @@ mod tests {
         assert!(c.safety.confirm_irreversible);
         assert_eq!(c.safety.max_steps, 50);
         assert!(!c.safety.allow_unlock);
-        assert_eq!(c.ios.backend_order, vec!["hid", "wda"]);
+        assert_eq!(c.ios.backend_order, vec!["hid"]);
         assert_eq!(c.llm.api_key_env(), "ANTHROPIC_API_KEY");
+        assert_eq!(c.llm.max_tokens, 16000);
+    }
+
+    #[test]
+    fn every_non_anthropic_provider_uses_openai_key_env() {
+        for p in [
+            "openai",
+            "openrouter",
+            "ollama",
+            "lmstudio",
+            "my-proxy",
+            "OpenAI",
+        ] {
+            let l = LlmConfig {
+                provider: p.into(),
+                ..LlmConfig::default()
+            };
+            assert_eq!(l.api_key_env(), "OPENAI_API_KEY", "provider {p}");
+            assert!(!l.is_anthropic());
+        }
+        let a = LlmConfig {
+            provider: "Anthropic".into(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(a.api_key_env(), "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn local_providers_need_no_key() {
+        let var = format!("AP_TEST_NO_SUCH_KEY_{}", std::process::id());
+        for p in ["ollama", "lmstudio"] {
+            let l = LlmConfig {
+                provider: p.into(),
+                openai_api_key_env: var.clone(),
+                ..LlmConfig::default()
+            };
+            assert_eq!(l.api_key().unwrap(), "");
+        }
+        let l = LlmConfig {
+            provider: "openrouter".into(),
+            openai_api_key_env: var,
+            ..LlmConfig::default()
+        };
+        assert!(l.api_key().is_err());
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub struct DeviceInfo {
     pub os_version: String,
     /// Hardware model ("iPhone14,5", "Pixel 8").
     pub model: String,
-    /// Logical size in UI points (iOS) or pixels (Android).
+    /// Logical size: UI points on iOS, dp (density-independent pixels) on Android.
     pub screen_points: Size,
     /// Physical screenshot size in pixels.
     pub screen_pixels: Size,
@@ -137,6 +137,12 @@ pub trait Device: Send + Sync {
     /// Accessibility / UI hierarchy as text (XML or JSON), if the backend has one.
     async fn ui_tree(&self) -> Result<Option<String>> {
         Err(Error::unsupported("ui_tree"))
+    }
+
+    /// The app in the foreground (bundle id or package name), if the backend
+    /// knows it. `Ok(None)` = unknown. Privacy guards treat unknown as unsafe.
+    async fn foreground_app(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Go to the home screen.
