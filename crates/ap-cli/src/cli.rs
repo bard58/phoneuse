@@ -50,6 +50,21 @@ pub enum Command {
     },
     /// Check the setup and print how to fix each problem.
     Doctor,
+    /// Test the phone step by step and write a report for the developer.
+    #[command(
+        after_help = "The steps: setup check, phone connection, screenshot, then an input test.
+The input test runs only after you answer y. It presses Home, swipes one time
+on the home screen, and presses Home again. It does not type and does not tap.
+Exit code 0: every step that ran passed. Exit code 1: a step failed or you pressed Ctrl+C."
+    )]
+    Selftest {
+        /// Folder for the screenshots and the report.
+        #[arg(long, value_name = "DIR", default_value = "selftest")]
+        out: PathBuf,
+        /// Run the input test without the question.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List connected phones.
     Devices,
     /// Use this phone by default.
@@ -330,6 +345,18 @@ mod tests {
             Some(Command::Mcp { http: None })
         ));
         assert!(parse(&["devices", "--json"]).json);
+        match parse(&["selftest"]).command {
+            Some(Command::Selftest { out, yes }) => {
+                assert_eq!((out, yes), (PathBuf::from("selftest"), false));
+            }
+            c => panic!("{c:?}"),
+        }
+        match parse(&["selftest", "--yes", "--out", "x"]).command {
+            Some(Command::Selftest { out, yes }) => {
+                assert!(yes && out == std::path::Path::new("x"))
+            }
+            c => panic!("{c:?}"),
+        }
         assert!(matches!(
             parse(&["config", "set", "llm.model", "x"]).command,
             Some(Command::Config {

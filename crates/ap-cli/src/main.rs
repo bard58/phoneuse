@@ -10,6 +10,7 @@ mod ios;
 mod jev;
 mod mcp;
 mod run;
+mod selftest;
 mod setup;
 mod ui;
 
@@ -95,6 +96,9 @@ async fn execute(cli: Cli) -> Result<u8> {
             if !doctor::run(&cfg_path, wanted, json).await? {
                 return Ok(1);
             }
+        }
+        Command::Selftest { out, yes } => {
+            return selftest::command(&cfg_path, wanted, &out, yes, json).await;
         }
         Command::Config { action } => config_cmd::run(action, &cfg_path, json)?,
         Command::Completions { shell } => {

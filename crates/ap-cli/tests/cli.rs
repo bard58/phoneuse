@@ -25,6 +25,11 @@ fn version_and_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--px").and(predicate::str::contains("0.5 0.5")));
+    agentphone(&cfg)
+        .args(["selftest", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes").and(predicate::str::contains("--out")));
     // No arguments and no terminal: print help, never start the wizard.
     agentphone(&cfg)
         .assert()
