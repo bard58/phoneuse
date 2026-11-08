@@ -184,6 +184,10 @@ pub const IOS_TOUCH_MIN_MAJOR: u16 = 27;
 /// The fix text for an iPhone that is older than [`IOS_TOUCH_MIN_MAJOR`].
 pub const IOS_UPDATE_HINT: &str = "Update the iPhone in Settings > General > Software Update.";
 
+/// The message for an iPhone with iOS 27 or later that turned touch off at
+/// run time (the screen stream or the touch service did not open).
+pub const IOS_TOUCH_OFF_MESSAGE: &str = "Touch input is off: the iPhone did not open the screen stream or the touch service that touch needs. Buttons and keys can still work. Run `agentphone doctor` to mount the Developer Disk Image again.";
+
 /// The problem text for an iPhone with iOS `os_version` and no touch input.
 pub fn ios_touch_problem(os_version: &str) -> String {
     format!(
@@ -220,15 +224,17 @@ pub fn touch_unavailable(info: &DeviceInfo, caps: Capabilities) -> Option<String
     if caps.has_touch() {
         return None;
     }
-    let old_ios = info.platform == Platform::Ios
-        && major_of(&info.os_version).is_some_and(|m| m < IOS_TOUCH_MIN_MAJOR);
-    Some(if old_ios {
-        ios_touch_message(&info.os_version)
-    } else {
-        format!(
+    let ios_major = (info.platform == Platform::Ios)
+        .then(|| major_of(&info.os_version))
+        .flatten();
+    Some(match ios_major {
+        Some(m) if m < IOS_TOUCH_MIN_MAJOR => ios_touch_message(&info.os_version),
+        // iOS 27 or later: the backend turned touch off at run time.
+        Some(_) => IOS_TOUCH_OFF_MESSAGE.to_string(),
+        None => format!(
             "This {} device has no touch input with the {} backend.",
             info.platform, info.backend
-        )
+        ),
     })
 }
 
@@ -287,6 +293,9 @@ mod tests {
             m,
             "Touch input needs iOS 27 or later. This iPhone has iOS 26.3. Update the iPhone in Settings > General > Software Update."
         );
+        // iOS 27 with touch turned off at run time: no update message.
+        let m = touch_unavailable(&info(Platform::Ios, "27.0.1"), screen_only).unwrap();
+        assert_eq!(m, IOS_TOUCH_OFF_MESSAGE);
         let m = touch_unavailable(&info(Platform::Android, "15"), screen_only).unwrap();
         assert!(m.contains("no touch input"), "{m}");
         let e = ios_touch_error("18.7.3");

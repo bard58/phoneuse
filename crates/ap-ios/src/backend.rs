@@ -12,6 +12,8 @@
 //!
 //! The public API (`IosProvider`, `IosDevice`, `setup`) does not change.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ap_core::{Button, Capabilities, Error, Frame, Key, Point, Result};
@@ -26,6 +28,15 @@ pub trait IosBackend {
     fn name(&self) -> &'static str;
 
     fn capabilities(&self) -> Capabilities;
+
+    /// A flag that the backend sets while touch input is off, after
+    /// [`IosBackend::capabilities`] said that touch works (for example, the
+    /// device refused the screen stream on iOS 27). While it is set, the
+    /// device capabilities have no `tap` and no `swipe`. `None`: the
+    /// capabilities do not change.
+    fn touch_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 
     async fn screenshot(&mut self) -> Result<Frame>;
 

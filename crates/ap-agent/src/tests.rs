@@ -576,6 +576,10 @@ struct TestDevice {
     foreground: Option<String>,
     /// How many times the agent called `Device::cancel`.
     cancels: Arc<Mutex<u32>>,
+    /// A tap fails with a setup error and turns touch off (as an iPhone on
+    /// iOS 27 that refuses the screen stream).
+    tap_loses_touch: bool,
+    touch_lost: Arc<Mutex<bool>>,
 }
 
 impl TestDevice {
@@ -587,6 +591,8 @@ impl TestDevice {
             shots: Arc::default(),
             foreground: None,
             cancels: Arc::default(),
+            tap_loses_touch: false,
+            touch_lost: Arc::default(),
         }
     }
 }
@@ -597,7 +603,16 @@ impl ap_core::Device for TestDevice {
         self.inner.info()
     }
     fn capabilities(&self) -> ap_core::Capabilities {
-        self.inner.capabilities()
+        let c = self.inner.capabilities();
+        if *self.touch_lost.lock().unwrap() {
+            ap_core::Capabilities {
+                tap: false,
+                swipe: false,
+                ..c
+            }
+        } else {
+            c
+        }
     }
     fn cancel(&self) {
         *self.cancels.lock().unwrap() += 1;
@@ -614,6 +629,13 @@ impl ap_core::Device for TestDevice {
         self.inner.screenshot().await
     }
     async fn tap(&self, at: Point) -> ap_core::Result<()> {
+        if self.tap_loses_touch {
+            *self.touch_lost.lock().unwrap() = true;
+            return Err(ap_core::Error::setup(
+                "Touch input is off: the iPhone did not open the screen stream that touch needs (error 9021).",
+                "Run `agentphone doctor`",
+            ));
+        }
         self.inner.tap(at).await
     }
     async fn double_tap(&self, at: Point) -> ap_core::Result<()> {
@@ -1113,4 +1135,70 @@ async fn no_touch_input_stops_before_the_first_llm_call() {
     assert_eq!(out.steps, 0);
     assert!(p.requests().is_empty());
     assert!(dev.calls().is_empty());
+}
+
+/// An iPhone on iOS 27 that refuses the screen stream: the first tap fails
+/// and turns touch off. The run ends after that tool result, with no second
+/// LLM call, so the model cannot loop on taps that fail.
+#[tokio::test]
+async fn lost_touch_ends_the_run_after_the_failed_action() {
+    let mut info = ap_core::Device::info(&mock()).clone();
+    info.os_version = "27.0".into();
+    let mut dev = TestDevice::new(&mock().with_info(info));
+    dev.tap_loses_touch = true;
+    let lost = dev.touch_lost.clone();
+    let p = Scripted::new(vec![
+        call("tap", json!({"x": 0.5, "y": 0.5})),
+        call("tap", json!({"x": 0.5, "y": 0.6})),
+    ]);
+    let out = agent_on(
+        p.clone(),
+        dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("open Settings")
+    .await;
+    let Outcome::Failed { error } = &out.outcome else {
+        panic!("{:?}", out.outcome);
+    };
+    assert!(error.starts_with("screen only, no touch input:"), "{error}");
+    assert!(error.contains(ap_core::IOS_TOUCH_OFF_MESSAGE), "{error}");
+    assert!(error.contains("error 9021"), "{error}");
+    assert!(*lost.lock().unwrap());
+    assert_eq!(out.steps, 1);
+    assert_eq!(p.requests().len(), 1);
+    // The failed tap is in the transcript as an error result.
+    let m = out.transcript.last().unwrap();
+    assert!(matches!(
+        m.content.first(),
+        Some(ContentBlock::ToolResult { is_error: true, .. })
+    ));
+}
+
+/// A failed action on a phone that still has touch does not end the run.
+#[tokio::test]
+async fn a_failed_action_with_touch_keeps_the_run() {
+    let dev = TestDevice::new(&mock().with_capabilities(ap_core::Capabilities {
+        launch_app: false,
+        ..ap_core::Capabilities::ALL
+    }));
+    let p = Scripted::new(vec![
+        call("open_app", json!({"app": "com.apple.Preferences"})),
+        call("done", json!({"summary": "ok", "success": true})),
+    ]);
+    let out = agent_on(
+        p.clone(),
+        dev,
+        Arc::new(Host::default()),
+        AgentOptions::default(),
+    )
+    .run("open Settings")
+    .await;
+    assert!(
+        matches!(out.outcome, Outcome::Done { success: true, .. }),
+        "{:?}",
+        out.outcome
+    );
+    assert_eq!(p.requests().len(), 2);
 }

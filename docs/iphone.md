@@ -225,7 +225,7 @@ names from `crates/ap-ios/src/setup.rs` and the names that doctor shows.
 | `developer_mode` | Developer Mode | Developer Mode is off. | Do [step 4](#4-turn-on-developer-mode). |
 | `ddi` | Developer disk image | The DDI is not mounted. | Run `agentphone setup ios`. Do this after each restart. |
 | `tunnel` | Secure connection | The CoreDevice tunnel does not open. | Unlock the iPhone. Connect the cable again. Run doctor again. |
-| `hid_services` | Touch and keyboard input | Fail: the iPhone does not have the HID services. Warning: iOS is older than 27, so touch input does not work (screen only). | Fail: mount the DDI again. If the services stay missing, agentphone cannot control this iOS version. Warning: update the iPhone in Settings > General > Software Update. |
+| `hid_services` | Input services (touch, buttons, keys) | Fail: the iPhone does not have the services for screenshots, buttons, and keys (`hid.indigo`, `dtservicehub`). On iOS 27 or later, it also fails when the touch services (`universalhidservice`, `displayservice`) are missing. Warning: iOS is older than 27, so touch input does not work (screen only). Screenshots, buttons, and keys are not affected. | Fail: mount the DDI again. If the services stay missing, agentphone cannot control this iOS version. Warning: update the iPhone in Settings > General > Software Update. |
 | `wifi_pairing` | Wi-Fi pairing | No Wi-Fi pairing is saved (warning only). | Do [step 6](#6-optional-use-wi-fi) with the cable connected. |
 
 When one check fails, doctor does not show the checks after it. Fix the first
@@ -247,7 +247,17 @@ problem, then run `agentphone doctor` again.
   - `agentphone run` stops before the first AI model call, because the agent
     cannot do a task without touch.
   - Buttons and keys go to the IndigoHid service without the stream. This
-    is unverified.
+    is unverified. One public report (quern issue #624) says that iOS 26
+    accepts buttons without the stream. No report covers keys, or iOS 17
+    and 18.
+  - Back is an edge swipe, because iOS has no Back button. Thus Back needs
+    touch input, and it fails with the update message.
+- On iOS 27 or later, touch input goes off for the session when the iPhone
+  refuses the screen stream, when the stream offer gets no answer, or when a
+  touch service is missing. A touch call then fails with a fix that tells you
+  to mount the DDI again. The capabilities lose `tap` and `swipe`,
+  `agentphone run` ends after the failed action, and the MCP `status` tool
+  shows "screen only". Buttons and keys stay on. This is unverified.
 - Models newer than `iPhone18,5` can need a Cryptex1 developer disk image.
   agentphone does not support Cryptex1 yet, so input can fail on these
   models.

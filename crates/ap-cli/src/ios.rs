@@ -22,7 +22,7 @@ pub fn check_name(id: &str) -> &'static str {
         "developer_mode" => "Developer Mode",
         "ddi" => "Developer disk image",
         "tunnel" => "Secure connection",
-        "hid_services" => "Touch and keyboard input",
+        "hid_services" => "Input services (touch, buttons, keys)",
         "wifi_pairing" => "Wi-Fi pairing",
         _ => "iPhone check",
     }

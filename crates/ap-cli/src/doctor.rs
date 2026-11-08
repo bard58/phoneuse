@@ -579,8 +579,9 @@ Android
         assert!(p.fix.as_deref().unwrap().contains("setup llm"));
     }
 
-    /// Below iOS 27 the "Touch and keyboard input" line warns with the
-    /// update fix, but it does not fail doctor (screen and buttons work).
+    /// Below iOS 27 the "Input services" line warns with the update fix,
+    /// but it does not fail doctor (screenshots, buttons and keys are not
+    /// affected).
     #[test]
     fn touch_input_warns_below_ios_27() {
         let v = |s: &str| ap_ios::IosVersion::parse(s).unwrap();
@@ -588,7 +589,11 @@ Android
         let c = &checks[0];
         assert_eq!(
             (c.id.as_str(), c.name.as_str(), c.status),
-            ("hid_services", "Touch and keyboard input", Status::Warn)
+            (
+                "hid_services",
+                "Input services (touch, buttons, keys)",
+                Status::Warn
+            )
         );
         assert!(c.detail.contains("needs iOS 27"), "{}", c.detail);
         assert_eq!(

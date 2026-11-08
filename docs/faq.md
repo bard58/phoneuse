@@ -28,9 +28,10 @@ pin, so a change there can also change the result.
 iPhone XS, XS Max, and XR stop at iOS 18. agentphone connects to them, but
 touch input does not work, because these models cannot get iOS 27.
 
-Run `agentphone doctor`. If the "Touch and keyboard input" check fails,
-agentphone cannot control that iPhone. Below iOS 27, the check can pass and
-input still fails.
+Run `agentphone doctor`. If the "Input services (touch, buttons, keys)"
+check fails, agentphone cannot control that iPhone. Below iOS 27, the check
+shows a warning: touch input does not work, but screenshots, buttons, and
+keys can work.
 
 ## Why does an iPhone need Developer Mode?
 

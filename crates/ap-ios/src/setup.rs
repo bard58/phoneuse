@@ -127,18 +127,28 @@ fn problem(e: &Error) -> String {
     }
 }
 
-/// The `hid_services` check. The services can be present on iOS 17.4 to
-/// 26.x, but the device refuses the screen stream there (error 9021), so
-/// touch input fails. Thus below iOS 27 the check is a warning with the
-/// update fix, also when every service is present.
+/// The `hid_services` check.
+///
+/// * `hid.indigo` (buttons, keys) and `dtservicehub` (screenshots) are
+///   necessary on every version. When one is missing, the check fails.
+/// * Below iOS 27 the device refuses the screen stream (error 9021), so
+///   touch input fails. The check is a warning with the update fix, and the
+///   touch services (`universalhidservice`, `displayservice`) do not matter.
+/// * From iOS 27, a missing touch service fails the check with the DDI fix.
 pub fn hid_services_check(version: IosVersion, missing: &[&str]) -> CheckResult {
-    if !missing.is_empty() {
+    let touch_only = [tunnel::SVC_UHID, tunnel::SVC_DISPLAY];
+    let (touch, core): (Vec<&str>, Vec<&str>) =
+        missing.iter().partition(|s| touch_only.contains(*s));
+    if !core.is_empty() {
         return CheckResult::bad(
             "hid_services",
             Status::Fail,
-            format!("missing RSD services: {}", missing.join(", ")),
             format!(
-                "this iOS build or this DDI does not have the CoreDevice HID services; remount the DDI. If they stay missing, agentphone cannot drive iOS {version}"
+                "missing RSD services for screenshots, buttons and keys: {}",
+                core.join(", ")
+            ),
+            format!(
+                "this iOS build or this DDI does not have the CoreDevice services; remount the DDI. If they stay missing, agentphone cannot drive iOS {version}"
             ),
             Some(Action::MountDdi),
         );
@@ -148,11 +158,23 @@ pub fn hid_services_check(version: IosVersion, missing: &[&str]) -> CheckResult 
             "hid_services",
             Status::Warn,
             format!(
-                "{} Screenshots, buttons and keys work. The HID services are present, but the iPhone refuses the screen stream that touch needs (CoreDevice error 9021).",
+                "{} Screen only: this does not stop screenshots, buttons and keys. The iPhone refuses the screen stream that touch needs (CoreDevice error 9021).",
                 ap_core::ios_touch_problem(&version.to_string())
             ),
             ap_core::IOS_UPDATE_HINT,
             None,
+        );
+    }
+    if !touch.is_empty() {
+        return CheckResult::bad(
+            "hid_services",
+            Status::Fail,
+            format!(
+                "missing RSD services for touch input: {}. Buttons and keys do not need them.",
+                touch.join(", ")
+            ),
+            "mount the Developer Disk Image again: the touch daemon comes with the DDI, not with iOS. Early iOS 27 betas have no touch services: update the iPhone in Settings > General > Software Update",
+            Some(Action::MountDdi),
         );
     }
     CheckResult::ok(
@@ -924,10 +946,41 @@ mod tests {
             (c.status, c.fix_action),
             (Status::Fail, Some(Action::MountDdi))
         );
-        // A missing service is still a failure below 27.
+        // Below 27 a missing touch service does not matter: buttons and
+        // keys do not need it, and touch is off anyway.
+        let c = hid_services_check(v("26.3"), &["com.apple.coredevice.displayservice"]);
+        assert_eq!((c.status, c.fix_action), (Status::Warn, None));
+        assert!(
+            c.detail
+                .contains("does not stop screenshots, buttons and keys")
+        );
+        // A missing service for screenshots, buttons or keys fails on any
+        // version.
+        let c = hid_services_check(v("26.3"), &["com.apple.instruments.dtservicehub"]);
         assert_eq!(
-            hid_services_check(v("26.3"), &["com.apple.coredevice.displayservice"]).status,
-            Status::Fail
+            (c.status, c.fix_action),
+            (Status::Fail, Some(Action::MountDdi))
+        );
+        // From 27, a missing touch service fails with the DDI fix first.
+        let c = hid_services_check(
+            v("27.0"),
+            &[
+                "com.apple.coredevice.displayservice",
+                "com.apple.coredevice.hid.universalhidservice",
+            ],
+        );
+        assert_eq!(
+            (c.status, c.fix_action),
+            (Status::Fail, Some(Action::MountDdi))
+        );
+        assert!(c.detail.contains("touch input"), "{}", c.detail);
+        assert!(
+            c.fix_hint
+                .as_deref()
+                .unwrap()
+                .starts_with("mount the Developer Disk Image"),
+            "{:?}",
+            c.fix_hint
         );
     }
 

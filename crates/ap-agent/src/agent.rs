@@ -119,6 +119,10 @@ struct RunState {
     digit_run: u32,
     /// The last action typed text (a tap now may press Send).
     typed_recently: bool,
+    /// An action failed and the phone has no touch input now (for example,
+    /// an iPhone on iOS 27 refused the screen stream). The run ends after
+    /// this tool result: later taps cannot work.
+    touch_lost: Option<String>,
     step: u32,
     usage: UsageLog,
 }
@@ -434,6 +438,10 @@ impl Agent {
                     summary: out.summary(),
                 });
                 results.push(ContentBlock::tool_result(id, out.content, out.is_error));
+                if let Some(error) = st.touch_lost.take() {
+                    st.messages.push(Message::user(results));
+                    return self.finish(Outcome::Failed { error }, st);
+                }
             }
             st.messages.push(Message::user(results));
         }
@@ -633,6 +641,14 @@ impl Agent {
         let msg = match result {
             Ok(m) => m,
             Err(e) => {
+                // The run started with touch (see `run`). A device that has
+                // no touch now cannot do the task: end the run, and do not
+                // let the model send more taps that fail.
+                if let Some(why) =
+                    ap_core::touch_unavailable(self.device.info(), self.device.capabilities())
+                {
+                    st.touch_lost = Some(format!("screen only, no touch input: {why} ({e})"));
+                }
                 let mut t = format!("error: {e}");
                 if let Some(h) = e.hint() {
                     t.push_str(&format!(" (fix: {h})"));

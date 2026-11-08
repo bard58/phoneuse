@@ -15,11 +15,18 @@
 //! background task per port reads and drops them.
 //!
 //! iOS below 27: the device refuses the stream with CoreDevice error 9021
-//! ("Remote control requires iOS 27.0 or later on this device"). The HID
-//! clients connect before the stream, so a refused stream does not stop
-//! buttons and keys (IndigoHid): quern #624 reports that iOS 26 accepts
-//! buttons without a stream. Touch calls then return a setup error with the
-//! update fix ([`ap_core::ios_touch_error`]), and they send nothing.
+//! ("Remote control requires iOS 27.0 or later on this device"). The
+//! backend does not send the offer there. IndigoHid connects alone, for
+//! buttons and keys: quern #624 reports that iOS 26 accepts buttons without
+//! a stream (unverified for keys). Touch calls and Back (an edge swipe)
+//! return a setup error with the update fix ([`ap_core::ios_touch_error`]),
+//! and they send nothing.
+//!
+//! iOS 27 or later: a refused stream, a stream offer with no answer, or a
+//! missing touch service turns touch off for the session. Buttons and keys
+//! stay on. Touch calls return [`touch_off_error`], and the shared flag of
+//! [`IosBackend::touch_flag`] removes tap and swipe from the device
+//! capabilities, so the hosts stop sending touch calls.
 //!
 //! Reconnect: a transport error closes the session, and the next call opens
 //! a new one. Input is never replayed. A call runs once more only when the
@@ -42,7 +49,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ap_core::{Button, Capabilities, Error, Frame, Key, Point, Result};
@@ -207,9 +214,11 @@ impl AuthGate {
             1, // display id 1 = main screen
             session,
         );
-        Box::pin(client.start_media_stream(video_params))
-            .await
-            .map_err(ctx("start video stream"))?;
+        if let Err(e) = Box::pin(client.start_media_stream(video_params)).await {
+            // The audio stream can be running: stop it before the client goes.
+            best_effort("stop_media_stream", client.stop_media_stream()).await;
+            return Err(ctx("start video stream")(e));
+        }
 
         let dropped_bytes = Arc::new(AtomicU64::new(0));
         let drains = vec![
@@ -250,16 +259,17 @@ impl Drop for AuthGate {
 
 struct Input {
     // Field order = drop order: clients before the gate.
-    uhid: UniversalHidServiceClient<Box<dyn ReadWrite>>,
+    /// `None` when touch is off (see `refused`).
+    uhid: Option<UniversalHidServiceClient<Box<dyn ReadWrite>>>,
     indigo: IndigoHidClient<Box<dyn ReadWrite>>,
     /// `None` when the stream did not open (see `refused`).
     gate: Option<AuthGate>,
-    /// Why the stream is not open. Touch calls then fail. Buttons and keys
+    /// Why touch input is off. Touch calls then fail. Buttons and keys
     /// still go to IndigoHid.
     refused: Option<String>,
 }
 
-/// What to do when the stream did not open.
+/// What to do when a touch step (the touch client or the stream) failed.
 #[derive(Debug, PartialEq, Eq)]
 enum GateFailure {
     /// Keep the HID clients and block touch. The text is the reason.
@@ -268,89 +278,144 @@ enum GateFailure {
     Fail,
 }
 
-/// Decide what a failed stream open means. Below iOS 27 every failure turns
-/// touch off (the device refuses the stream there). From iOS 27, a refusal
-/// (error 9021) or another device answer turns touch off, and a transport
-/// error fails the open, so the call can reconnect.
-fn gate_failure(version: IosVersion, e: &Error) -> GateFailure {
-    if !version.touch_supported() || is_stream_refusal(e) || !is_transport(e) {
-        GateFailure::TouchOff(e.to_string())
-    } else {
+/// Decide what a failed touch step means (iOS 27 or later only: below 27
+/// the backend does not open the stream). A lost link (`NotConnected`,
+/// `Io`) fails the open, so the call can reconnect. Every other failure
+/// turns touch off and keeps buttons and keys: a refusal (error 9021),
+/// another device answer, and a stream offer that gets no answer in
+/// [`GATE_TIMEOUT`].
+fn gate_failure(e: &Error) -> GateFailure {
+    if !is_stream_refusal(e) && matches!(e, Error::NotConnected(_) | Error::Io(_)) {
         GateFailure::Fail
+    } else {
+        GateFailure::TouchOff(e.to_string())
+    }
+}
+
+/// Why touch is off before any touch I/O, or `None` when the backend must
+/// try the touch client and the stream.
+fn touch_skip_reason(version: IosVersion, has_uhid: bool, has_display: bool) -> Option<String> {
+    if !version.touch_supported() {
+        return Some(ap_core::ios_touch_problem(&version.to_string()));
+    }
+    let missing: Vec<_> = [
+        (has_uhid, tunnel::SVC_UHID),
+        (has_display, tunnel::SVC_DISPLAY),
+    ]
+    .into_iter()
+    .filter_map(|(has, s)| (!has).then_some(s))
+    .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "the iPhone does not offer the touch services ({})",
+            missing.join(", ")
+        )
+    })
+}
+
+/// Run one touch step (connect the touch client, or open the stream) with
+/// the [`GATE_TIMEOUT`] limit. `Ok(Err(why))`: touch is off, and buttons
+/// and keys stay on. `Err`: the link is gone.
+async fn touch_step<G>(
+    what: &str,
+    step: impl Future<Output = Result<G>>,
+) -> Result<Result<G, String>> {
+    match within(GATE_TIMEOUT, step).await {
+        Ok(g) => Ok(Ok(g)),
+        Err(e) => match gate_failure(&e) {
+            GateFailure::TouchOff(why) => Ok(Err(format!("{what} ({why})"))),
+            GateFailure::Fail => Err(e),
+        },
     }
 }
 
 impl Input {
     async fn open(t: &mut Tunnel, version: IosVersion) -> Result<Self> {
-        let missing: Vec<_> = [tunnel::SVC_UHID, tunnel::SVC_INDIGO]
-            .into_iter()
-            .filter(|s| !t.has(s))
-            .collect();
-        if !missing.is_empty() {
+        if !t.has(tunnel::SVC_INDIGO) {
             return Err(Error::setup(
                 format!(
-                    "the iPhone does not offer the HID services ({})",
-                    missing.join(", ")
+                    "the iPhone does not offer the HID service for buttons and keys ({})",
+                    tunnel::SVC_INDIGO
                 ),
                 DDI_HINT,
             ));
         }
-        // HID clients first: a refused stream must not stop buttons and keys.
-        let uhid = UniversalHidServiceClient::connect_rsd(&mut t.adapter, &mut t.rsd)
-            .await
-            .map_err(ctx("universalhidservice"))?;
+        // Buttons and keys first: a touch problem must not stop them.
         let indigo = IndigoHidClient::connect_rsd(&mut t.adapter, &mut t.rsd)
             .await
             .map_err(ctx("hid.indigo"))?;
-        if !t.has(tunnel::SVC_DISPLAY) {
-            let why = format!("the iPhone does not offer {}", tunnel::SVC_DISPLAY);
-            tracing::warn!("{why}; touch input is off, buttons and keys only");
-            return Ok(Self {
-                uhid,
-                indigo,
-                gate: None,
-                refused: Some(why),
-            });
-        }
-        let opened = tokio::time::timeout(GATE_TIMEOUT, Box::pin(AuthGate::open(t)))
-            .await
-            .unwrap_or(Err(Error::Timeout(GATE_TIMEOUT)));
-        let (gate, refused) = match opened {
-            Ok(g) => (Some(g), None),
-            Err(e) => match gate_failure(version, &e) {
-                GateFailure::TouchOff(why) => {
-                    tracing::warn!(
-                        "iOS {version}: the screen stream did not open ({why}); touch input is off, buttons and keys only"
-                    );
-                    (None, Some(why))
-                }
-                GateFailure::Fail => return Err(e),
-            },
-        };
-        Ok(Self {
-            uhid,
+        let mut input = Self {
+            uhid: None,
             indigo,
-            gate,
-            refused,
+            gate: None,
+            refused: None,
+        };
+        // Below iOS 27 the device refuses the stream: do not send the offer.
+        if let Some(why) =
+            touch_skip_reason(version, t.has(tunnel::SVC_UHID), t.has(tunnel::SVC_DISPLAY))
+        {
+            tracing::warn!("iOS {version}: touch input is off ({why}); buttons and keys only");
+            input.refused = Some(why);
+            return Ok(input);
+        }
+        let uhid = touch_step("the touch client did not connect", async {
+            UniversalHidServiceClient::connect_rsd(&mut t.adapter, &mut t.rsd)
+                .await
+                .map_err(ctx("universalhidservice"))
         })
+        .await?;
+        let uhid = match uhid {
+            Ok(u) => u,
+            Err(why) => {
+                tracing::warn!("iOS {version}: {why}; touch input is off, buttons and keys only");
+                input.refused = Some(why);
+                return Ok(input);
+            }
+        };
+        input.uhid = Some(uhid);
+        match touch_step(
+            "the iPhone did not open the screen stream that touch needs",
+            Box::pin(AuthGate::open(t)),
+        )
+        .await?
+        {
+            Ok(g) => input.gate = Some(g),
+            Err(why) => {
+                tracing::warn!("iOS {version}: {why}; touch input is off, buttons and keys only");
+                input.refused = Some(why);
+            }
+        }
+        Ok(input)
     }
 }
 
-/// The error for a touch call when the stream did not open on iOS 27 or
-/// later. Below 27 the call gets [`ap_core::ios_touch_error`] instead.
-fn stream_refused_error(why: &str) -> Error {
-    Error::setup(
-        format!(
-            "touch input is off: the iPhone did not open the screen stream that touch needs ({why})"
-        ),
-        "update the iPhone in Settings > General > Software Update. If it is up to date, run `agentphone doctor` to mount the Developer Disk Image again",
-    )
+/// The fix text for touch that is off on iOS 27 or later.
+const TOUCH_OFF_HINT: &str = "Run `agentphone doctor` to mount the Developer Disk Image again, then try again. If touch stays off, update the iPhone in Settings > General > Software Update";
+
+/// The error for a touch call when touch is off on iOS 27 or later. Below
+/// 27 the call gets [`ap_core::ios_touch_error`] instead.
+fn touch_off_error(why: &str) -> Error {
+    Error::setup(format!("Touch input is off: {why}."), TOUCH_OFF_HINT)
 }
 
 /// The error for a touch call on `version`, before any I/O, or `None` when
 /// the version allows touch.
 fn touch_version_error(version: IosVersion) -> Option<Error> {
     (!version.touch_supported()).then(|| ap_core::ios_touch_error(&version.to_string()))
+}
+
+/// The error for the Back button on `version`, or `None` when the version
+/// allows touch. iOS has no Back button: Back is an edge swipe.
+fn back_version_error(version: IosVersion) -> Option<Error> {
+    (!version.touch_supported()).then(|| {
+        Error::setup(
+            format!(
+                "Back is an edge swipe (iOS has no Back button), so it needs touch input. {}",
+                ap_core::ios_touch_problem(&version.to_string())
+            ),
+            ap_core::IOS_UPDATE_HINT,
+        )
+    })
 }
 
 struct Session {
@@ -373,6 +438,10 @@ pub struct HidBackend {
     cancel: CancelCheck,
     /// The iOS version of the device (touch input needs 27 or later).
     version: IosVersion,
+    /// Set while touch is off on a version that allows touch (the stream
+    /// or the touch client did not open). `IosDevice::capabilities` reads
+    /// it, so the hosts stop sending taps that cannot work.
+    touch_off: Arc<AtomicBool>,
 }
 
 /// Run `f` with a time limit. An expired limit gives [`Error::Timeout`].
@@ -523,6 +592,7 @@ impl HidBackend {
             session: None,
             cancel: CancelCheck::default(),
             version,
+            touch_off: Arc::default(),
         }
     }
 
@@ -566,9 +636,15 @@ impl HidBackend {
 
     async fn input(&mut self) -> Result<&mut Input> {
         let version = self.version;
+        let touch_off = self.touch_off.clone();
         let s = self.session().await?;
         if s.input.is_none() {
-            s.input = Some(Box::pin(Input::open(&mut s.tunnel, version)).await?);
+            let i = Box::pin(Input::open(&mut s.tunnel, version)).await?;
+            touch_off.store(
+                version.touch_supported() && i.refused.is_some(),
+                Ordering::Relaxed,
+            );
+            s.input = Some(i);
         }
         s.input
             .as_mut()
@@ -583,10 +659,12 @@ impl HidBackend {
             return Err(e);
         }
         let i = self.input().await?;
-        if let Some(why) = &i.refused {
-            return Err(stream_refused_error(why));
+        match (&mut i.uhid, &i.refused) {
+            (Some(u), None) => Ok(u),
+            (_, why) => Err(touch_off_error(
+                why.as_deref().unwrap_or("the touch client is missing"),
+            )),
         }
-        Ok(&mut i.uhid)
     }
 
     /// The DVT client, for one new channel (screenshot or process control).
@@ -920,10 +998,15 @@ impl IosBackend for HidBackend {
     }
 
     /// From the iOS version: below iOS 27 there is no tap or swipe (screen
-    /// only). On iOS 27+ a refused stream shows at the first touch call, as
-    /// the error of [`stream_refused_error`].
+    /// only). On iOS 27+ a refused stream shows at the first input call: the
+    /// touch call gets [`touch_off_error`], and [`IosBackend::touch_flag`]
+    /// turns tap and swipe off.
     fn capabilities(&self) -> Capabilities {
         self.version.capabilities()
+    }
+
+    fn touch_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.touch_off.clone())
     }
 
     async fn screenshot(&mut self) -> Result<Frame> {
@@ -978,6 +1061,9 @@ impl IosBackend for HidBackend {
 
     async fn button(&mut self, button: Button) -> Result<()> {
         if button == Button::Back {
+            if let Some(e) = back_version_error(self.version) {
+                return Err(e);
+            }
             // iOS has no back button: slide a finger in from the left edge.
             return self
                 .swipe(
@@ -1153,82 +1239,144 @@ mod tests {
         assert!(is_transport(&e));
     }
 
+    fn closed_backend(version: IosVersion) -> HidBackend {
+        // The source points at a closed port: any I/O fails.
+        HidBackend::new(
+            TunnelSource::RemotePairing {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                path: PathBuf::from("does-not-exist"),
+            },
+            None,
+            version,
+        )
+    }
+
+    fn refusal() -> Error {
+        Error::Protocol(
+            "start audio stream: device returned an error: Dictionary({\"code\": Integer(9021)})"
+                .into(),
+        )
+    }
+
+    #[test]
+    fn a_refused_stream_turns_touch_off_and_a_lost_link_fails() {
+        let lost = Error::NotConnected("broken pipe".into());
+        assert!(matches!(
+            gate_failure(&refusal()),
+            GateFailure::TouchOff(w) if w.contains("9021")
+        ));
+        // Another device answer and a stream offer with no answer: touch off.
+        assert!(matches!(
+            gate_failure(&Error::Protocol("bad offer".into())),
+            GateFailure::TouchOff(_)
+        ));
+        assert!(matches!(
+            gate_failure(&Error::Timeout(GATE_TIMEOUT)),
+            GateFailure::TouchOff(_)
+        ));
+        // A lost link reconnects.
+        assert_eq!(gate_failure(&lost), GateFailure::Fail);
+        assert_eq!(
+            gate_failure(&Error::Io(std::io::Error::other("reset"))),
+            GateFailure::Fail
+        );
+        let e = touch_off_error("the iPhone did not open the screen stream (9021)");
+        assert!(e.to_string().starts_with("Touch input is off: "), "{e}");
+        let hint = e.hint().unwrap();
+        assert!(hint.starts_with("Run `agentphone doctor`"), "{hint}");
+        assert!(hint.contains("Software Update"), "{hint}");
+        assert!(!is_transport(&e));
+    }
+
+    /// The touch step keeps the input (buttons and keys) on a refusal and on
+    /// a stream offer that gets no answer. Only a lost link fails the open.
+    #[tokio::test(start_paused = true)]
+    async fn touch_step_keeps_buttons_on_a_refusal_and_a_timeout() {
+        let r = touch_step("stream", async { Err::<(), _>(refusal()) })
+            .await
+            .unwrap();
+        assert!(matches!(&r, Err(w) if w.starts_with("stream (") && w.contains("9021")));
+        let r = touch_step("stream", std::future::pending::<Result<()>>())
+            .await
+            .unwrap();
+        assert!(matches!(&r, Err(w) if w.contains("timed out")), "{r:?}");
+        let e = touch_step("stream", async {
+            Err::<(), _>(Error::NotConnected("x".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(is_transport(&e));
+        assert_eq!(touch_step("stream", async { Ok(7) }).await.unwrap(), Ok(7));
+    }
+
+    #[test]
+    fn below_27_the_stream_is_not_opened() {
+        let v = |s: &str| IosVersion::parse(s).unwrap();
+        // Below 27: touch is off before any offer, also with every service.
+        let why = touch_skip_reason(v("26.3"), true, true).unwrap();
+        assert!(why.contains("needs iOS 27"), "{why}");
+        assert!(touch_skip_reason(v("17.4"), true, true).is_some());
+        // From 27: a missing touch service turns touch off (buttons stay).
+        assert!(touch_skip_reason(v("27.0"), true, true).is_none());
+        let why = touch_skip_reason(v("27.0"), false, true).unwrap();
+        assert!(why.contains(tunnel::SVC_UHID), "{why}");
+        let why = touch_skip_reason(v("27.0"), true, false).unwrap();
+        assert!(why.contains(tunnel::SVC_DISPLAY) && !why.contains(tunnel::SVC_UHID));
+    }
+
+    #[test]
+    fn capabilities_follow_the_version() {
+        let v = |s: &str| IosVersion::parse(s).unwrap();
+        let mut b = closed_backend(v("26.3"));
+        let c = b.capabilities();
+        assert!(!c.tap && !c.swipe && c.buttons && c.keys && c.screenshot);
+        b.version = v("27.0");
+        assert!(b.capabilities().tap);
+        // The flag for IosDevice starts off.
+        let flag = b.touch_flag().unwrap();
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn touch_is_blocked_below_ios_27() {
         let v = |s: &str| IosVersion::parse(s).unwrap();
         let e = touch_version_error(v("26.3")).unwrap();
         assert_eq!(
             e.to_string(),
-            "Touch input needs iOS 27 or later. This iPhone has iOS 26.3.\n  fix: Update the iPhone in Settings > General > Software Update."
+            "Touch input needs iOS 27 or later. This iPhone has iOS 26.3.
+  fix: Update the iPhone in Settings > General > Software Update."
         );
         // A setup error: no layer replays it as a lost link.
         assert!(!is_transport(&e));
         assert!(touch_version_error(v("27.0")).is_none());
+        assert!(back_version_error(v("27.0")).is_none());
     }
 
-    #[test]
-    fn a_refused_stream_turns_touch_off_and_keeps_buttons() {
-        let v = |s: &str| IosVersion::parse(s).unwrap();
-        let refusal = Error::Protocol(
-            "start audio stream: device returned an error: Dictionary({\"code\": Integer(9021)})"
-                .into(),
-        );
-        let lost = Error::NotConnected("broken pipe".into());
-        // Below 27: every failure turns touch off, also a lost link.
-        assert!(matches!(
-            gate_failure(v("26.3"), &refusal),
-            GateFailure::TouchOff(_)
-        ));
-        assert!(matches!(
-            gate_failure(v("18.7.3"), &lost),
-            GateFailure::TouchOff(_)
-        ));
-        // From 27: a refusal turns touch off, a lost link reconnects.
-        assert!(matches!(
-            gate_failure(v("27.0"), &refusal),
-            GateFailure::TouchOff(w) if w.contains("9021")
-        ));
-        assert_eq!(gate_failure(v("27.0"), &lost), GateFailure::Fail);
-        let e = stream_refused_error("9021");
-        assert!(e.hint().unwrap().contains("Software Update"), "{e}");
-        assert!(!is_transport(&e));
-        // Buttons and keys stay on in the capabilities below 27.
-        let mut b = HidBackend::new(
-            TunnelSource::RemotePairing {
-                addr: "127.0.0.1:1".parse().unwrap(),
-                path: PathBuf::from("x"),
-            },
-            None,
-            v("26.3"),
-        );
-        let c = b.capabilities();
-        assert!(!c.tap && !c.swipe && c.buttons && c.keys && c.screenshot);
-        b.version = v("27.0");
-        assert!(b.capabilities().tap);
-    }
-
-    /// Below iOS 27 a touch call fails at once with the update fix, and it
-    /// opens no tunnel (the source here points at a closed port).
+    /// Below iOS 27 every touch call (and Back, an edge swipe) fails at once
+    /// with the update fix, and it opens no tunnel.
     #[tokio::test]
     async fn touch_call_below_27_fails_without_io() {
-        let mut b = HidBackend::new(
-            TunnelSource::RemotePairing {
-                addr: "127.0.0.1:1".parse().unwrap(),
-                path: PathBuf::from("does-not-exist"),
-            },
-            None,
-            IosVersion::new(26, 7, 0),
+        let mut b = closed_backend(IosVersion::new(26, 7, 0));
+        let d = Duration::from_millis(50);
+        let errors = vec![
+            b.tap(Point::CENTER).await.unwrap_err(),
+            b.double_tap(Point::CENTER).await.unwrap_err(),
+            b.long_press(Point::CENTER, d).await.unwrap_err(),
+            b.swipe(Point::CENTER, Point::new(0.5, 0.1), d)
+                .await
+                .unwrap_err(),
+            b.pinch(Point::CENTER, 0.1, 0.5, d).await.unwrap_err(),
+        ];
+        for e in &errors {
+            assert!(e.to_string().contains("needs iOS 27"), "{e}");
+            assert_eq!(e.hint(), Some(ap_core::IOS_UPDATE_HINT));
+        }
+        let e = b.button(Button::Back).await.unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("Back is an edge swipe (iOS has no Back button), so it needs touch input. Touch input needs iOS 27"),
+            "{e}"
         );
-        let e = b.tap(Point::CENTER).await.unwrap_err();
-        assert!(e.to_string().contains("needs iOS 27"), "{e}");
-        let e = b
-            .swipe(
-                Point::CENTER,
-                Point::new(0.5, 0.1),
-                Duration::from_millis(50),
-            )
-            .await
-            .unwrap_err();
         assert_eq!(e.hint(), Some(ap_core::IOS_UPDATE_HINT));
         assert!(b.session.is_none());
     }

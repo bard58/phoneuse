@@ -21,10 +21,11 @@ agentphone is early software. Read this before you use it.
   expected on 17.x. Thus touch input does not work on iOS 17.4 to 26.x.
   agentphone then works in "screen only" mode: screenshots, buttons, and keys
   can work, and a touch call stops with "Touch input needs iOS 27 or later".
-  `agentphone run` stops before the first AI model call. Models newer than
-  `iPhone18,5` can need a Cryptex1 developer disk image, which agentphone
-  does not support yet. `agentphone doctor` shows a warning on the "Touch and
-  keyboard input" check below iOS 27.
+  Back is an edge swipe, so Back needs touch input too. `agentphone run`
+  stops before the first AI model call. Models newer than `iPhone18,5` can
+  need a Cryptex1 developer disk image, which agentphone does not support
+  yet. `agentphone doctor` shows a warning on the "Input services (touch,
+  buttons, keys)" check below iOS 27.
 - Report problems in the issue tracker of
   [bard58/phoneuse](https://github.com/bard58/phoneuse/issues).
 

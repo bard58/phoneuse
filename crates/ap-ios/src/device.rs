@@ -1,5 +1,7 @@
 //! [`IosDevice`]: an ap-core [`Device`] backed by an [`IosBackend`].
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ap_core::device::check_point;
@@ -25,11 +27,26 @@ pub const SCROLL_DURATION: Duration = Duration::from_millis(350);
 pub struct IosDevice {
     info: DeviceInfo,
     caps: Capabilities,
+    /// Set by the backend while touch is off (see `IosBackend::touch_flag`).
+    touch_off: Option<Arc<AtomicBool>>,
     version: IosVersion,
     worker: Worker,
     /// The app opened by the last `launch_app`, until the next input.
     /// iOS gives no foreground-app query over this route.
     last_app: AppTracker,
+}
+
+/// `caps` with tap and swipe off while `touch_off` is set.
+fn caps_now(caps: Capabilities, touch_off: Option<&AtomicBool>) -> Capabilities {
+    if touch_off.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        Capabilities {
+            tap: false,
+            swipe: false,
+            ..caps
+        }
+    } else {
+        caps
+    }
 }
 
 /// Tracks the app opened by `launch_app` (see [`IosDevice::foreground_app`]).
@@ -144,7 +161,7 @@ impl IosDevice {
         let cfg = cfg.clone();
         let id = id.to_string();
         let name = format!("ap-ios-{}", id.chars().take(12).collect::<String>());
-        let (worker, (info, caps, version)) = Worker::start(name, move || async move {
+        let (worker, (info, caps, touch_off, version)) = Worker::start(name, move || async move {
             let r = Box::pin(resolve(&cfg, &id)).await?;
             let kinds = select_backends(r.version, &cfg.backend_order)?;
             let mut last = None;
@@ -157,7 +174,8 @@ impl IosDevice {
                             Box::pin(measure_unknown_screen(&mut *b, &mut info)).await;
                         }
                         let caps = b.capabilities();
-                        return Ok((b, (info, caps, r.version)));
+                        let touch_off = b.touch_flag();
+                        return Ok((b, (info, caps, touch_off, r.version)));
                     }
                     Err(e) => {
                         tracing::warn!("iOS backend {} failed: {e}", kind.name());
@@ -171,6 +189,7 @@ impl IosDevice {
         Ok(IosDevice {
             info,
             caps,
+            touch_off,
             version,
             worker,
             last_app: AppTracker::default(),
@@ -220,8 +239,11 @@ impl Device for IosDevice {
         self.worker.cancel_handle().cancel();
     }
 
+    /// The backend capabilities. Tap and swipe go off while the backend
+    /// reports that touch is off (for example, a refused screen stream on
+    /// iOS 27), so the hosts stop sending touch calls.
     fn capabilities(&self) -> Capabilities {
-        self.caps
+        caps_now(self.caps, self.touch_off.as_deref())
     }
 
     async fn screenshot(&self) -> Result<Frame> {
@@ -361,6 +383,18 @@ mod tests {
         assert_eq!(t.get(), None);
     }
 
+    /// A backend flag for "touch is off" removes tap and swipe, and keeps
+    /// buttons and keys. The hosts then see a phone with no touch.
+    #[test]
+    fn touch_flag_turns_tap_and_swipe_off() {
+        let flag = AtomicBool::new(false);
+        assert_eq!(caps_now(Capabilities::ALL, None), Capabilities::ALL);
+        assert_eq!(caps_now(Capabilities::ALL, Some(&flag)), Capabilities::ALL);
+        flag.store(true, Ordering::Relaxed);
+        let c = caps_now(Capabilities::ALL, Some(&flag));
+        assert!(!c.has_touch() && c.buttons && c.keys && c.type_text && c.screenshot);
+    }
+
     /// Accepts every call.
     struct Null;
 
@@ -420,6 +454,7 @@ mod tests {
                 backend: "null".into(),
             },
             caps: Capabilities::NONE,
+            touch_off: None,
             version: IosVersion::parse("26.0").unwrap(),
             worker,
             last_app: AppTracker::default(),
