@@ -39,15 +39,21 @@ pub enum Error {
 }
 
 impl Error {
-    /// True for errors a retry can fix: 408, 409, 429, 5xx, 529, network, timeout.
+    /// True for errors a retry can fix: 408, 409, 429, 5xx, 529 and network
+    /// errors (connect timeouts included).
+    ///
+    /// False for quota and billing errors (a retry cannot fix them) and for
+    /// [`Error::Timeout`]: the request reached the server, which may still
+    /// finish and bill it, so a resend can bill the same long call again.
     pub fn is_retryable(&self) -> bool {
         match self {
+            Error::Api { kind, .. } if is_quota_kind(kind) => false,
             Error::Api { status, kind, .. } => {
                 retryable_status(*status)
                     || kind == "overloaded_error"
                     || kind == "rate_limit_error"
             }
-            Error::Network(_) | Error::Timeout(_) => true,
+            Error::Network(_) => true,
             _ => false,
         }
     }
@@ -61,6 +67,40 @@ impl Error {
     }
 }
 
+/// Error kinds (OpenAI `type` or `code`) that no retry can fix.
+pub(crate) fn is_quota_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "insufficient_quota" | "billing_hard_limit_reached" | "billing_not_active"
+    )
+}
+
 pub(crate) fn retryable_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 429 | 500..=599)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(status: u16, kind: &str) -> Error {
+        Error::Api {
+            provider: "openai",
+            status,
+            kind: kind.into(),
+            message: String::new(),
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn retry_rules() {
+        assert!(api(429, "rate_limit_error").is_retryable());
+        assert!(api(529, "overloaded_error").is_retryable());
+        assert!(!api(429, "insufficient_quota").is_retryable());
+        assert!(!api(429, "billing_hard_limit_reached").is_retryable());
+        assert!(!api(400, "invalid_request_error").is_retryable());
+        assert!(Error::Network("reset".into()).is_retryable());
+        assert!(!Error::Timeout(Duration::from_secs(600)).is_retryable());
+    }
 }

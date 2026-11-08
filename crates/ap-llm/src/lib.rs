@@ -75,40 +75,144 @@ pub fn install_crypto_provider() {
     });
 }
 
-/// Build the provider named in the config ("anthropic" or "openai").
-/// Reads the API key from the env var the config names. For "openai" a
-/// missing key is allowed when `base_url` points at a local server.
+/// Default base URL for a provider name when `llm.base_url` is not set.
+///
+/// Ollama and LM Studio default to their local servers, so a missing
+/// `base_url` never sends screenshots to a cloud API.
+pub fn default_base_url(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => anthropic::DEFAULT_BASE_URL,
+        "ollama" => "http://localhost:11434/v1",
+        "lmstudio" | "lm-studio" | "lm_studio" => "http://localhost:1234/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        _ => openai::DEFAULT_BASE_URL,
+    }
+}
+
+/// The base URL the provider will use: `llm.base_url` when set and not
+/// blank, else [`default_base_url`].
+pub fn resolved_base_url(cfg: &ap_core::LlmConfig) -> String {
+    cfg.base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_base_url(&cfg.provider).to_string())
+}
+
+/// True when the config needs an API key in the environment to run.
+/// Always true for Anthropic. False for OpenAI-compatible providers that
+/// need no key (Ollama, LM Studio) or that point at a local server.
+/// [`provider_from_config`] uses the same rule.
+pub fn key_required(cfg: &ap_core::LlmConfig) -> bool {
+    if cfg.is_anthropic() {
+        return true;
+    }
+    !cfg.key_optional() && !openai::is_local(&resolved_base_url(cfg))
+}
+
+/// Build the provider named in the config. "anthropic" (or "claude") uses
+/// the Messages API; every other name uses the OpenAI wire format.
+/// Reads the API key from the env var the config names. A missing key is
+/// allowed when [`key_required`] is false.
 pub fn provider_from_config(cfg: &ap_core::LlmConfig) -> Result<Arc<dyn Provider>> {
-    match cfg.provider.to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" => {
-            let key = cfg.api_key().map_err(|e| Error::Config(e.to_string()))?;
-            let mut opts = AnthropicOptions::new(key);
-            opts.model = cfg.model.clone();
-            if let Some(b) = &cfg.base_url {
-                opts.base_url = b.clone();
-            }
-            Ok(Arc::new(AnthropicProvider::new(opts)?))
+    if cfg.provider.trim().is_empty() {
+        return Err(Error::Config(
+            "llm.provider is empty (use \"anthropic\" or an OpenAI-compatible name such as \"openai\")"
+                .into(),
+        ));
+    }
+    let base = resolved_base_url(cfg);
+    if cfg.is_anthropic() {
+        let key = cfg.api_key().map_err(|e| Error::Config(e.to_string()))?;
+        let mut opts = AnthropicOptions::new(key);
+        opts.model = cfg.model.clone();
+        opts.base_url = base;
+        return Ok(Arc::new(AnthropicProvider::new(opts)?));
+    }
+    // Ollama / LM Studio return Ok("") when no key is set.
+    let key = cfg.api_key().ok().filter(|k| !k.is_empty());
+    if key.is_none() && key_required(cfg) {
+        return Err(Error::Config(format!(
+            "no API key: set the environment variable {}",
+            cfg.api_key_env()
+        )));
+    }
+    let mut opts = OpenAiOptions::new(cfg.model.clone());
+    opts.api_key = key;
+    opts.base_url = base;
+    Ok(Arc::new(OpenAiCompatibleProvider::new(opts)?))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn cfg(provider: &str, base_url: Option<&str>) -> ap_core::LlmConfig {
+        ap_core::LlmConfig {
+            provider: provider.into(),
+            model: "m".into(),
+            base_url: base_url.map(str::to_string),
+            // Env vars that no test environment sets.
+            anthropic_api_key_env: "AP_LLM_TEST_NO_SUCH_KEY_A".into(),
+            openai_api_key_env: "AP_LLM_TEST_NO_SUCH_KEY_O".into(),
+            ..Default::default()
         }
-        "openai" | "openai-compatible" | "openrouter" | "ollama" | "lmstudio" => {
-            // Ollama / LM Studio return Ok("") when no key is set.
-            let key = cfg.api_key().ok().filter(|k| !k.is_empty());
-            let base = cfg
-                .base_url
-                .clone()
-                .unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_string());
-            if key.is_none() && !openai::is_local(&base) && !cfg.key_optional() {
-                return Err(Error::Config(format!(
-                    "no API key: set the environment variable {}",
-                    cfg.api_key_env()
-                )));
-            }
-            let mut opts = OpenAiOptions::new(cfg.model.clone());
-            opts.api_key = key;
-            opts.base_url = base;
-            Ok(Arc::new(OpenAiCompatibleProvider::new(opts)?))
+    }
+
+    #[test]
+    fn local_providers_default_to_localhost() {
+        assert_eq!(
+            resolved_base_url(&cfg("ollama", None)),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            resolved_base_url(&cfg(" Ollama ", Some("  "))),
+            "http://localhost:11434/v1"
+        );
+        for p in ["lmstudio", "lm-studio", "lm_studio"] {
+            assert_eq!(resolved_base_url(&cfg(p, None)), "http://localhost:1234/v1");
         }
-        other => Err(Error::Config(format!(
-            "unknown LLM provider '{other}' (use \"anthropic\" or \"openai\")"
-        ))),
+        assert_eq!(
+            resolved_base_url(&cfg("openrouter", None)),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            resolved_base_url(&cfg("ollama", Some("http://10.0.0.5:11434/v1"))),
+            "http://10.0.0.5:11434/v1"
+        );
+    }
+
+    #[test]
+    fn provider_names_are_trimmed_and_open_ended() {
+        // Local / key-optional names build without a key.
+        for p in ["ollama", "lm-studio", "lm_studio", " lmstudio "] {
+            let pr = provider_from_config(&cfg(p, None)).unwrap();
+            assert_eq!(pr.name(), "openai", "provider {p}");
+        }
+        // Any other name is OpenAI-compatible; a local base_url needs no key.
+        let pr = provider_from_config(&cfg("together", Some("http://127.0.0.1:9/v1"))).unwrap();
+        assert_eq!(pr.name(), "openai");
+        // A remote OpenAI-compatible host still needs a key.
+        let e = provider_from_config(&cfg("together", None)).err().unwrap();
+        assert!(matches!(e, Error::Config(_)), "{e:?}");
+        // " anthropic" with a stray space is Anthropic (and needs a key).
+        let e = provider_from_config(&cfg(" anthropic", None))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("API key"), "{e}");
+        assert!(provider_from_config(&cfg("  ", None)).is_err());
+    }
+
+    #[test]
+    fn key_required_rule() {
+        assert!(key_required(&cfg("anthropic", None)));
+        assert!(key_required(&cfg("openai", None)));
+        assert!(!key_required(&cfg(
+            "openai",
+            Some("http://localhost:11434/v1")
+        )));
+        assert!(!key_required(&cfg("ollama", None)));
+        assert!(!key_required(&cfg("lm-studio", None)));
     }
 }

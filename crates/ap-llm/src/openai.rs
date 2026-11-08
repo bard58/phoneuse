@@ -13,7 +13,8 @@ use std::time::Duration;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Map, Value, json};
 
-use crate::http::{PostJson, RetryPolicy, build_client};
+use crate::anthropic::EMPTY_PLACEHOLDER;
+use crate::http::{PostJson, RetryPolicy, build_client, request_timeout};
 use crate::types::{ContentBlock, Message, Request, Response, Role, StopReason, Usage};
 use crate::{Error, Provider, Result};
 
@@ -35,6 +36,8 @@ pub struct OpenAiOptions {
     pub model: String,
     /// Including `/v1`.
     pub base_url: String,
+    /// Minimum whole-request timeout; raised per call for a large
+    /// `max_tokens`. A timeout is not retried.
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub retry: RetryPolicy,
@@ -50,7 +53,7 @@ impl OpenAiOptions {
             api_key: None,
             model: model.into(),
             base_url: DEFAULT_BASE_URL.into(),
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_secs(600),
             connect_timeout: Duration::from_secs(15),
             retry: RetryPolicy::default(),
             max_tokens_field: None,
@@ -95,7 +98,7 @@ impl OpenAiCompatibleProvider {
         if opts.model.trim().is_empty() {
             return Err(Error::Config("model is empty".into()));
         }
-        let client = build_client(opts.timeout, opts.connect_timeout)?;
+        let client = build_client(opts.connect_timeout)?;
         let url = format!("{}/chat/completions", opts.base_url.trim_end_matches('/'));
         let mut headers = HeaderMap::new();
         if let Some(k) = opts.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
@@ -202,10 +205,14 @@ fn messages_to_wire(m: &Message, out: &mut Vec<Value>) {
                 })
                 .collect();
             let mut v = json!({"role": "assistant"});
-            v["content"] = if text.is_empty() {
-                Value::Null
-            } else {
+            v["content"] = if !text.is_empty() {
                 json!(text.join("\n"))
+            } else if calls.is_empty() {
+                // Servers reject an assistant message with neither content
+                // nor tool_calls (an empty turn echoed back).
+                json!(EMPTY_PLACEHOLDER)
+            } else {
+                Value::Null
             };
             if !calls.is_empty() {
                 v["tool_calls"] = Value::Array(calls);
@@ -213,6 +220,7 @@ fn messages_to_wire(m: &Message, out: &mut Vec<Value>) {
             out.push(v);
         }
         Role::User => {
+            let start = out.len();
             let mut parts = Vec::new();
             let mut result_images = Vec::new();
             for b in &m.content {
@@ -257,6 +265,9 @@ fn messages_to_wire(m: &Message, out: &mut Vec<Value>) {
             }
             if !parts.is_empty() {
                 out.push(json!({"role": "user", "content": parts}));
+            } else if out.len() == start {
+                // Nothing usable: keep the turn so roles still alternate.
+                out.push(json!({"role": "user", "content": EMPTY_PLACEHOLDER}));
             }
         }
     }
@@ -367,9 +378,12 @@ pub(crate) fn parse_response(body: &str) -> Result<Response> {
 fn parse_error(status: u16, body: &str) -> (String, String) {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let e = v.get("error");
-    let kind = e
-        .and_then(|e| e.get("type").or_else(|| e.get("code")))
-        .and_then(Value::as_str)
+    let field = |k: &str| e.and_then(|e| e.get(k)).and_then(Value::as_str);
+    // A quota `code` wins over a generic `type`, so the retry rule sees it.
+    let kind = field("code")
+        .filter(|c| crate::error::is_quota_kind(c))
+        .or_else(|| field("type"))
+        .or_else(|| field("code"))
         .map(str::to_string)
         .unwrap_or_else(|| format!("http_{status}"));
     let message = e
@@ -399,7 +413,7 @@ impl Provider for OpenAiCompatibleProvider {
             headers: &self.headers,
             body: &body,
             policy: &self.opts.retry,
-            timeout: self.opts.timeout,
+            timeout: request_timeout(self.opts.timeout, request.max_tokens),
             provider: PROVIDER,
             parse_error,
         }
@@ -478,6 +492,79 @@ mod tests {
         assert_eq!(m[4]["role"], "user");
         assert_eq!(m[4]["content"][1]["type"], "image_url");
         assert_eq!(m.len(), 5);
+    }
+
+    #[test]
+    fn empty_messages_get_placeholder_content() {
+        let p = OpenAiCompatibleProvider::new(OpenAiOptions::new("m")).unwrap();
+        let r = Request::new(
+            "",
+            vec![
+                Message::user_text("go"),
+                Message::assistant(vec![]),
+                Message::user(vec![ContentBlock::text("")]),
+                Message::assistant(vec![ContentBlock::Thinking {
+                    thinking: "t".into(),
+                    signature: None,
+                }]),
+                Message::user_text("Continue."),
+            ],
+        );
+        let b = p.build_body(&r).unwrap();
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 5);
+        for (i, msg) in m.iter().enumerate() {
+            let want = if i % 2 == 0 { "user" } else { "assistant" };
+            assert_eq!(msg["role"], want);
+            assert!(!msg["content"].is_null(), "{msg}");
+        }
+        assert_eq!(m[1]["content"], EMPTY_PLACEHOLDER);
+        assert_eq!(m[2]["content"], EMPTY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn quota_code_is_kind_and_not_retryable() {
+        let (kind, _) = parse_error(
+            429,
+            r#"{"error":{"message":"no credit","type":"requests","code":"insufficient_quota"}}"#,
+        );
+        assert_eq!(kind, "insufficient_quota");
+        let e = Error::Api {
+            provider: PROVIDER,
+            status: 429,
+            kind,
+            message: String::new(),
+            request_id: None,
+        };
+        assert!(!e.is_retryable());
+        let (kind, _) = parse_error(
+            429,
+            r#"{"error":{"type":"rate_limit_exceeded","code":"x"}}"#,
+        );
+        assert_eq!(kind, "rate_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn insufficient_quota_is_not_retried() {
+        let srv = TestServer::start(vec![Reply::json(
+            429,
+            r#"{"error":{"message":"quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        )])
+        .await;
+        let mut o = OpenAiOptions::new("m");
+        o.base_url = format!("{}/v1", srv.url());
+        o.retry = RetryPolicy {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+        };
+        let p = OpenAiCompatibleProvider::new(o).unwrap();
+        let e = p
+            .complete(Request::new("s", vec![Message::user_text("hi")]))
+            .await
+            .unwrap_err();
+        assert_eq!(e.status(), Some(429));
+        assert_eq!(srv.requests().len(), 1);
     }
 
     #[test]

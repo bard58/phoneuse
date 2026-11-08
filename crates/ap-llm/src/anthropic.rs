@@ -19,7 +19,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
-use crate::http::{PostJson, RetryPolicy, build_client};
+use crate::http::{PostJson, RetryPolicy, build_client, request_timeout};
 use crate::types::{ContentBlock, Message, Request, Response, Role, StopReason, Usage};
 use crate::{Error, Provider, Result};
 
@@ -48,7 +48,9 @@ pub struct AnthropicOptions {
     /// Without `/v1` (e.g. `https://api.anthropic.com`).
     pub base_url: String,
     pub api_version: String,
-    /// Whole-request timeout (non-streaming; thinking can take a while).
+    /// Minimum whole-request timeout (non-streaming; thinking can take a
+    /// while). Raised per call for a large `max_tokens`. A timeout is not
+    /// retried, because the server may still finish and bill the call.
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub retry: RetryPolicy,
@@ -64,7 +66,7 @@ impl AnthropicOptions {
             model: crate::models::CLAUDE_OPUS_5_5.into(),
             base_url: DEFAULT_BASE_URL.into(),
             api_version: API_VERSION.into(),
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_secs(600),
             connect_timeout: Duration::from_secs(15),
             retry: RetryPolicy::default(),
             fallbacks: Fallbacks::Auto,
@@ -96,7 +98,7 @@ impl AnthropicProvider {
         if !crate::models::is_known(&opts.model) {
             tracing::warn!(model = %opts.model, "model id is not one of {:?}", crate::models::KNOWN);
         }
-        let client = build_client(opts.timeout, opts.connect_timeout)?;
+        let client = build_client(opts.connect_timeout)?;
         let base = opts.base_url.trim_end_matches('/');
         let base = base.strip_suffix("/v1").unwrap_or(base);
         let url = format!("{base}/v1/messages");
@@ -203,9 +205,17 @@ fn message_to_wire(m: &Message) -> Value {
         Role::User => "user",
         Role::Assistant => "assistant",
     };
-    let content: Vec<Value> = m.content.iter().filter_map(block_to_wire).collect();
+    let mut content: Vec<Value> = m.content.iter().filter_map(block_to_wire).collect();
+    if content.is_empty() {
+        // The API rejects a message with empty content (e.g. an empty
+        // assistant turn echoed back). Keep the turn, with a placeholder.
+        content.push(json!({"type": "text", "text": EMPTY_PLACEHOLDER}));
+    }
     json!({"role": role, "content": content})
 }
+
+/// Text sent in place of a message whose content is empty on the wire.
+pub(crate) const EMPTY_PLACEHOLDER: &str = "(empty)";
 
 fn block_to_wire(b: &ContentBlock) -> Option<Value> {
     Some(match b {
@@ -317,12 +327,24 @@ pub(crate) fn parse_response(body: &str) -> Result<Response> {
         _ => return Err(Error::Decode("response has no content array".into())),
     };
     let u = v.get("usage").cloned().unwrap_or_default();
-    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let usage = Usage {
-        input_tokens: n("input_tokens"),
-        output_tokens: n("output_tokens"),
-        cache_creation_input_tokens: n("cache_creation_input_tokens"),
-        cache_read_input_tokens: n("cache_read_input_tokens"),
+    let usage_of = |u: &Value| {
+        let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Usage {
+            input_tokens: n("input_tokens"),
+            output_tokens: n("output_tokens"),
+            cache_creation_input_tokens: n("cache_creation_input_tokens"),
+            cache_read_input_tokens: n("cache_read_input_tokens"),
+        }
+    };
+    // With server-side fallbacks the top-level usage covers only the attempt
+    // that produced the message. `usage.iterations` lists every billed
+    // attempt (a declined one included), so sum it when present.
+    let usage = match u.get("iterations").and_then(Value::as_array) {
+        Some(its) if !its.is_empty() => its.iter().fold(Usage::default(), |mut acc, it| {
+            acc.add(&usage_of(it));
+            acc
+        }),
+        _ => usage_of(&u),
     };
     let stop_details = v.get("stop_details").filter(|d| !d.is_null()).map(|d| {
         let cat = d
@@ -380,7 +402,7 @@ impl Provider for AnthropicProvider {
             headers: &headers,
             body: &body,
             policy: &self.opts.retry,
-            timeout: self.opts.timeout,
+            timeout: request_timeout(self.opts.timeout, request.max_tokens),
             provider: PROVIDER,
             parse_error,
         }
@@ -527,6 +549,94 @@ mod tests {
         .unwrap();
         assert_eq!(r.content.len(), 2);
         assert_eq!(r.text(), "partial\nrest");
+    }
+
+    #[test]
+    fn usage_sums_fallback_iterations() {
+        let r = parse_response(
+            r#"{"id":"m","model":"claude-opus-4-8","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"done"}],
+            "usage":{"input_tokens":1000,"output_tokens":200,
+              "cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+              "iterations":[
+                {"type":"message","model":"claude-opus-5-5","input_tokens":1000,"output_tokens":3000,
+                 "cache_creation_input_tokens":50,"cache_read_input_tokens":400},
+                {"type":"fallback_message","model":"claude-opus-4-8","input_tokens":1000,"output_tokens":200,
+                 "cache_creation_input_tokens":0,"cache_read_input_tokens":0}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.usage.input_tokens, 2000);
+        assert_eq!(r.usage.output_tokens, 3200);
+        assert_eq!(r.usage.cache_creation_input_tokens, 50);
+        assert_eq!(r.usage.cache_read_input_tokens, 400);
+        // Without iterations the top-level usage is used as before.
+        let r = parse_response(
+            r#"{"id":"m","model":"x","stop_reason":"end_turn","content":[],
+            "usage":{"input_tokens":7,"output_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens), (7, 3));
+    }
+
+    #[test]
+    fn empty_messages_get_placeholder_content() {
+        let p = provider(DEFAULT_BASE_URL);
+        let r = Request::new(
+            "sys",
+            vec![
+                Message::user_text("go"),
+                // An empty assistant turn (content [] or only empty text).
+                Message::assistant(vec![ContentBlock::text("")]),
+                Message::user_text("Continue."),
+                Message::assistant(vec![]),
+                Message::user(vec![ContentBlock::text("")]),
+            ],
+        );
+        let b = p.build_body(&r).unwrap();
+        for m in b["messages"].as_array().unwrap() {
+            let c = m["content"].as_array().unwrap();
+            assert!(!c.is_empty(), "{m}");
+        }
+        assert_eq!(b["messages"][1]["content"][0]["text"], EMPTY_PLACEHOLDER);
+        assert_eq!(b["messages"][3]["content"][0]["text"], EMPTY_PLACEHOLDER);
+    }
+
+    #[tokio::test]
+    async fn quota_and_should_retry_false_are_not_retried() {
+        let srv = TestServer::start(vec![
+            Reply::json(
+                529,
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#,
+            )
+            .header("x-should-retry", "false"),
+        ])
+        .await;
+        let p = provider(&srv.url());
+        let e = p
+            .complete(Request::new("", vec![Message::user_text("x")]))
+            .await
+            .unwrap_err();
+        assert_eq!(e.status(), Some(529));
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn huge_retry_after_gives_up_without_panic() {
+        let srv = TestServer::start(vec![
+            Reply::json(
+                429,
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}"#,
+            )
+            .header("retry-after", "1e20"),
+        ])
+        .await;
+        let p = provider(&srv.url());
+        let e = p
+            .complete(Request::new("", vec![Message::user_text("x")]))
+            .await
+            .unwrap_err();
+        assert_eq!(e.status(), Some(429));
+        assert_eq!(srv.requests().len(), 1);
     }
 
     #[test]
