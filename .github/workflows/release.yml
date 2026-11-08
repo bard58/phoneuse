@@ -24,7 +24,7 @@ jobs:
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -47,7 +47,7 @@ jobs:
           mkdir -p "$name"
           cp target/${{ matrix.target }}/release/agentphone LICENSE README.md "$name"
           tar czf "$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: agentphone-*.*
@@ -56,8 +56,8 @@ jobs:
     needs: build
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: "*-apple-darwin"
           merge-multiple: true
@@ -69,7 +69,7 @@ jobs:
             agentphone-*-aarch64-apple-darwin/agentphone agentphone-*-x86_64-apple-darwin/agentphone
           cp LICENSE README.md "$name"
           tar czf "$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: universal-apple-darwin
           path: agentphone-*-universal-apple-darwin.tar.gz
@@ -78,10 +78,10 @@ jobs:
     needs: [build, universal-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             agentphone-*.zip
