@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     env:
       FEATURE_FLAGS: ${{ matrix.features == 'all' && '--all-features' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,7 +38,7 @@ jobs:
       - if: matrix.features == 'default'
         run: cargo build --release --locked -p ap-cli
       - if: matrix.features == 'default'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agentphone-${{ matrix.os }}
           path: |
@@ -52,7 +52,7 @@ jobs:
     name: MSRV (Rust 1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
